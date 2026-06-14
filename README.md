@@ -4,7 +4,7 @@ Experimental Drake batch simulation runtime extracted from the UniLab Go1 Drake 
 
 Current scope:
 
-- Go1-only native C++/pybind pool.
+- Go1-only compiled C++/pybind batch pool.
 - `nbatch` and `nthread` worker control.
 - Python API modeled after MuJoCoUni's `BatchEnvPool` direction.
 - Intended to be consumed by UniLab's Drake backend adapter.
@@ -12,13 +12,13 @@ Current scope:
 This is not a generic Drake backend yet. The next design step is to remove the
 remaining Go1 metadata arguments from the low-level pool constructor.
 
-## Build Native Extension
+## Build Batch Extension
 
 ```bash
-uv run python scripts/build_drake_native.py --drake-home /Users/huanghaochen/solver/drake/install
+uv run python scripts/build_drake_batch.py --drake-home /Users/huanghaochen/solver/drake/install
 ```
 
-The extension is written to `src/drakeuni/native/_drake_env_pool*.so`.
+The extension is written to `src/drakeuni/compiled/_drake_env_pool*.so`.
 
 ## Install Editable
 
@@ -28,11 +28,21 @@ From a consuming project:
 uv pip install -e /Users/huanghaochen/solver/drakeuni
 ```
 
-## API
+## Runtime API
 
 ```python
-from drakeuni.batch_env import DrakeEnvPool
+from drakeuni.runtime import DrakeRuntimeConfig, create_runtime
+
+runtime = create_runtime(
+    DrakeRuntimeConfig(
+        model_file="/path/to/scene_flat_drake.xml",
+        num_envs=32,
+        sim_dt=0.002,
+        mode="batch",
+        nthread=8,
+    )
+)
 ```
 
-`NativeDrakeEnvPool` remains as an alias while UniLab's native Drake adapter is
-being cut over.
+The preferred integration point is `drakeuni.runtime`. `DrakeEnvPool` and
+UniLab is being cut over to the runtime protocol.

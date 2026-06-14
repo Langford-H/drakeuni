@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstddef>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -115,14 +116,14 @@ void RequireShape(const py::buffer_info& info, const std::vector<py::ssize_t>& s
   }
 }
 
-struct EnvRuntime {
+struct ThreadWorkspace {
   Context<double>* plant_context{};
   std::unique_ptr<Simulator<double>> simulator;
 };
 
-class NativeDrakeEnvPool {
+class DrakeEnvPool {
  public:
-  NativeDrakeEnvPool(const std::string& model_file, int nbatch, double sim_dt,
+  DrakeEnvPool(const std::string& model_file, int nbatch, double sim_dt,
                      py::array_t<double, py::array::c_style | py::array::forcecast> ctrl_limits,
                      py::array_t<double, py::array::c_style | py::array::forcecast> torque_limits,
                      int base_body_index, int push_body_index,
@@ -136,11 +137,11 @@ class NativeDrakeEnvPool {
         foot_body_indices_(foot_body_indices),
         foot_offsets_(std::move(foot_offsets)),
         kp_(kp),
-        kd_(kd),
-        nthread_(std::max(1, nthread)) {
+        kd_(kd) {
     if (nbatch_ < 1) {
       throw std::invalid_argument("nbatch must be >= 1");
     }
+    nthread_ = std::max(1, std::min(nbatch_, std::max(1, nthread)));
     auto ctrl_info = ctrl_limits_.request();
     if (ctrl_info.ndim != 2 || ctrl_info.shape[1] != 2) {
       throw std::invalid_argument("ctrl_limits must have shape (nu, 2)");
@@ -159,7 +160,7 @@ class NativeDrakeEnvPool {
     plant_->set_discrete_contact_approximation(DiscreteContactApproximation::kSap);
     const auto model_instances = Parser(plant_).AddModels(model_file);
     if (model_instances.size() != 1) {
-      throw std::runtime_error("NativeDrakeEnvPool expected exactly one model instance");
+      throw std::runtime_error("DrakeEnvPool expected exactly one model instance");
     }
     model_instance_ = model_instances.at(0);
 
@@ -188,9 +189,10 @@ class NativeDrakeEnvPool {
     if (nu_ != plant_->num_actuators()) {
       throw std::runtime_error("ctrl_limits length does not match plant actuators");
     }
-    envs_.reserve(nbatch_);
-    for (int i = 0; i < nbatch_; ++i) {
-      envs_.push_back(MakeRuntime());
+    compact_state_.assign(static_cast<std::size_t>(nbatch_) * state_dim_, 0.0);
+    workspaces_.reserve(nthread_);
+    for (int i = 0; i < nthread_; ++i) {
+      workspaces_.push_back(MakeWorkspace());
     }
   }
 
@@ -198,6 +200,7 @@ class NativeDrakeEnvPool {
   int state_dim() const { return state_dim_; }
   int control_dim() const { return nu_; }
   int nthread() const { return nthread_; }
+  int workspace_count() const { return static_cast<int>(workspaces_.size()); }
   int num_filtered_geometries() const { return num_filtered_geometries_; }
 
   py::dict step(py::array_t<double, py::array::c_style | py::array::forcecast> state0,
@@ -242,13 +245,15 @@ class NativeDrakeEnvPool {
     auto start = std::chrono::steady_clock::now();
     {
       py::gil_scoped_release release;
-      auto worker = [&](int begin, int end) {
+      auto worker = [&](int thread_index, int begin, int end) {
+        auto& workspace = workspaces_.at(thread_index);
         for (int env_index = begin; env_index < end; ++env_index) {
-          StepOne(env_index, state0, control, control_is_traj, nstep,
+          StepOne(workspace, env_index, state0, control, control_is_traj, nstep,
                   has_push ? &push_array : nullptr);
-          WriteState(env_index, state_out);
-          WriteSensors(env_index, gyro, local_linvel, global_linvel, global_angvel, upvector,
-                       base_pos, base_quat, dof_pos, dof_vel, feet_pos, feet_contact_force);
+          WriteState(workspace, env_index, state_out);
+          WriteSensors(workspace, env_index, gyro, local_linvel, global_linvel, global_angvel,
+                       upvector, base_pos, base_quat, dof_pos, dof_vel, feet_pos,
+                       feet_contact_force);
         }
       };
       RunChunks(worker);
@@ -295,7 +300,7 @@ class NativeDrakeEnvPool {
         if (env_index < 0 || env_index >= nbatch_) {
           throw std::out_of_range("env_id out of range");
         }
-        LoadState(env_index, &state(row, 0));
+        SaveCompactState(env_index, &state(row, 0));
       }
     }
     return Snapshot();
@@ -304,13 +309,13 @@ class NativeDrakeEnvPool {
   py::dict snapshot() { return Snapshot(); }
 
  private:
-  EnvRuntime MakeRuntime() {
-    EnvRuntime runtime;
+  ThreadWorkspace MakeWorkspace() {
+    ThreadWorkspace runtime;
     auto context = diagram_->CreateDefaultContext();
     runtime.plant_context = &plant_->GetMyMutableContextFromRoot(context.get());
     plant_->get_actuation_input_port(model_instance_)
         .FixValue(runtime.plant_context, Eigen::VectorXd::Zero(nu_));
-    SetNativePdTarget(Eigen::VectorXd::Zero(nu_), runtime.plant_context);
+    SetPdTarget(Eigen::VectorXd::Zero(nu_), runtime.plant_context);
     runtime.simulator = std::make_unique<Simulator<double>>(*diagram_, std::move(context));
     runtime.plant_context =
         &plant_->GetMyMutableContextFromRoot(&runtime.simulator->get_mutable_context());
@@ -319,26 +324,24 @@ class NativeDrakeEnvPool {
     return runtime;
   }
 
-  void LoadState(int env_index, const double* state_row) {
-    auto& runtime = envs_.at(env_index);
+  void LoadState(ThreadWorkspace& runtime, const double* state_row) {
     runtime.simulator->get_mutable_context().SetTime(state_row[0]);
     plant_->SetPositions(runtime.plant_context, MujocoQposToDrake(state_row + 1, nq_));
     plant_->SetVelocities(runtime.plant_context, MujocoQvelToDrake(state_row + 1 + nq_, nv_));
     if (nu_ > 0) {
       Eigen::VectorXd target = Eigen::Map<const Eigen::VectorXd>(state_row + 1 + kRootQposDim, nu_);
-      SetNativePdTarget(target, runtime.plant_context);
+      SetPdTarget(target, runtime.plant_context);
     }
     runtime.simulator->Initialize();
   }
 
-  void StepOne(int env_index,
+  void StepOne(ThreadWorkspace& runtime, int env_index,
                const py::array_t<double, py::array::c_style | py::array::forcecast>& state0,
                const py::array_t<double, py::array::c_style | py::array::forcecast>& control,
                bool control_is_traj, int nstep,
                const py::array_t<double, py::array::c_style | py::array::forcecast>* push_force) {
     auto state = state0.unchecked<2>();
-    LoadState(env_index, &state(env_index, 0));
-    auto& runtime = envs_.at(env_index);
+    LoadState(runtime, &state(env_index, 0));
     auto ctrl_limits = ctrl_limits_.unchecked<2>();
     for (int substep = 0; substep < nstep; ++substep) {
       Eigen::VectorXd target(nu_);
@@ -355,27 +358,26 @@ class NativeDrakeEnvPool {
                                  ctrl_limits(j, 1));
         }
       }
-      SetNativePdTarget(target, runtime.plant_context);
+      SetPdTarget(target, runtime.plant_context);
       if (push_force != nullptr) {
         auto push_values = push_force->unchecked<2>();
-        SetExternalPushForce(env_index, push_values(env_index, 0), push_values(env_index, 1),
+        SetExternalPushForce(runtime, push_values(env_index, 0), push_values(env_index, 1),
                              push_values(env_index, 2));
       } else {
-        SetExternalPushForce(env_index, 0.0, 0.0, 0.0);
+        SetExternalPushForce(runtime, 0.0, 0.0, 0.0);
       }
       runtime.simulator->AdvanceTo(runtime.simulator->get_context().get_time() + sim_dt_);
     }
   }
 
-  void SetNativePdTarget(const Eigen::VectorXd& target_q, Context<double>* plant_context) {
+  void SetPdTarget(const Eigen::VectorXd& target_q, Context<double>* plant_context) {
     Eigen::VectorXd desired(2 * nu_);
     desired.head(nu_) = target_q;
     desired.tail(nu_).setZero();
     plant_->get_desired_state_input_port(model_instance_).FixValue(plant_context, desired);
   }
 
-  void SetExternalPushForce(int env_index, double fx, double fy, double fz) {
-    auto& runtime = envs_.at(env_index);
+  void SetExternalPushForce(ThreadWorkspace& runtime, double fx, double fy, double fz) {
     std::vector<ExternallyAppliedSpatialForce<double>> forces;
     if (std::abs(fx) > 0.0 || std::abs(fy) > 0.0 || std::abs(fz) > 0.0) {
       ExternallyAppliedSpatialForce<double> applied;
@@ -387,23 +389,23 @@ class NativeDrakeEnvPool {
     plant_->get_applied_spatial_force_input_port().FixValue(runtime.plant_context, forces);
   }
 
-  void WriteState(int env_index, py::array_t<double>& state_out) const {
+  void WriteState(const ThreadWorkspace& runtime, int env_index, py::array_t<double>& state_out) {
     auto state = state_out.mutable_unchecked<2>();
-    const auto& runtime = envs_.at(env_index);
     state(env_index, 0) = runtime.simulator->get_context().get_time();
     Eigen::VectorXd q = plant_->GetPositions(*runtime.plant_context);
     Eigen::VectorXd v = plant_->GetVelocities(*runtime.plant_context);
     DrakeQposToMujoco(q, &state(env_index, 1));
     DrakeQvelToMujoco(v, &state(env_index, 1 + nq_));
+    SaveCompactState(env_index, &state(env_index, 0));
   }
 
-  void WriteSensors(int env_index, py::array_t<double>& gyro, py::array_t<double>& local_linvel,
+  void WriteSensors(const ThreadWorkspace& runtime, int env_index, py::array_t<double>& gyro,
+                    py::array_t<double>& local_linvel,
                     py::array_t<double>& global_linvel, py::array_t<double>& global_angvel,
                     py::array_t<double>& upvector, py::array_t<double>& base_pos,
                     py::array_t<double>& base_quat, py::array_t<double>& dof_pos,
                     py::array_t<double>& dof_vel, py::array_t<double>& feet_pos,
                     py::array_t<double>& feet_contact_force) const {
-    const auto& runtime = envs_.at(env_index);
     const RigidTransform<double> x_wb =
         plant_->EvalBodyPoseInWorld(*runtime.plant_context, *trunk_body_);
     const Eigen::Matrix3d r_bw = x_wb.rotation().matrix().transpose();
@@ -470,10 +472,19 @@ class NativeDrakeEnvPool {
     auto dof_vel = MakeArray({nbatch_, nu_});
     auto feet_pos = MakeArray({nbatch_, static_cast<int>(foot_bodies_.size()), 3});
     auto feet_contact_force = MakeArray({nbatch_, static_cast<int>(foot_bodies_.size()), 3});
-    for (int env_index = 0; env_index < nbatch_; ++env_index) {
-      WriteState(env_index, state_out);
-      WriteSensors(env_index, gyro, local_linvel, global_linvel, global_angvel, upvector, base_pos,
-                   base_quat, dof_pos, dof_vel, feet_pos, feet_contact_force);
+    {
+      py::gil_scoped_release release;
+      auto worker = [&](int thread_index, int begin, int end) {
+        auto& workspace = workspaces_.at(thread_index);
+        for (int env_index = begin; env_index < end; ++env_index) {
+          LoadState(workspace, CompactStateRow(env_index));
+          WriteState(workspace, env_index, state_out);
+          WriteSensors(workspace, env_index, gyro, local_linvel, global_linvel, global_angvel,
+                       upvector, base_pos, base_quat, dof_pos, dof_vel, feet_pos,
+                       feet_contact_force);
+        }
+      };
+      RunChunks(worker);
     }
     py::dict sensor;
     sensor["gyro"] = gyro;
@@ -492,6 +503,16 @@ class NativeDrakeEnvPool {
     output["sensor"] = sensor;
     output["timing"] = py::dict();
     return output;
+  }
+
+  void SaveCompactState(int env_index, const double* state_row) {
+    const auto row_start =
+        compact_state_.begin() + static_cast<std::ptrdiff_t>(env_index) * state_dim_;
+    std::copy(state_row, state_row + state_dim_, row_start);
+  }
+
+  const double* CompactStateRow(int env_index) const {
+    return compact_state_.data() + static_cast<std::size_t>(env_index) * state_dim_;
   }
 
   int ExcludeRobotSelfCollisions() {
@@ -515,7 +536,7 @@ class NativeDrakeEnvPool {
   void RunChunks(Worker worker) {
     const int thread_count = std::min(nthread_, nbatch_);
     if (thread_count <= 1) {
-      worker(0, nbatch_);
+      worker(0, 0, nbatch_);
       return;
     }
     std::vector<std::thread> threads;
@@ -523,7 +544,7 @@ class NativeDrakeEnvPool {
     for (int thread = 0; thread < thread_count; ++thread) {
       const int begin = thread * nbatch_ / thread_count;
       const int end = (thread + 1) * nbatch_ / thread_count;
-      threads.emplace_back([&, begin, end]() { worker(begin, end); });
+      threads.emplace_back([&, thread, begin, end]() { worker(thread, begin, end); });
     }
     for (auto& thread : threads) {
       thread.join();
@@ -551,17 +572,18 @@ class NativeDrakeEnvPool {
   const RigidBody<double>* trunk_body_{};
   const RigidBody<double>* push_body_{};
   std::vector<const RigidBody<double>*> foot_bodies_;
-  std::vector<EnvRuntime> envs_;
+  std::vector<double> compact_state_;
+  std::vector<ThreadWorkspace> workspaces_;
 };
 
-bool NativeAvailable() { return true; }
+bool BatchAvailable() { return true; }
 
 }  // namespace
 
 PYBIND11_MODULE(_drake_env_pool, m) {
-  m.doc() = "Optional native DrakeEnvPool for UniLab Go1 DrakeUni experiments.";
-  m.def("native_available", &NativeAvailable);
-  py::class_<NativeDrakeEnvPool>(m, "NativeDrakeEnvPool")
+  m.doc() = "Optional compiled DrakeEnvPool for UniLab Go1 DrakeUni experiments.";
+  m.def("batch_available", &BatchAvailable);
+  py::class_<DrakeEnvPool>(m, "DrakeEnvPool")
       .def(py::init<const std::string&, int, double,
                     py::array_t<double, py::array::c_style | py::array::forcecast>,
                     py::array_t<double, py::array::c_style | py::array::forcecast>, int, int,
@@ -572,14 +594,15 @@ PYBIND11_MODULE(_drake_env_pool, m) {
            py::arg("ctrl_limits"), py::arg("torque_limits"), py::arg("base_body_index"),
            py::arg("push_body_index"), py::arg("foot_body_indices"), py::arg("foot_offsets"),
            py::arg("kp"), py::arg("kd"), py::arg("nthread") = 1)
-      .def_property_readonly("nbatch", &NativeDrakeEnvPool::nbatch)
-      .def_property_readonly("state_dim", &NativeDrakeEnvPool::state_dim)
-      .def_property_readonly("control_dim", &NativeDrakeEnvPool::control_dim)
-      .def_property_readonly("nthread", &NativeDrakeEnvPool::nthread)
+      .def_property_readonly("nbatch", &DrakeEnvPool::nbatch)
+      .def_property_readonly("state_dim", &DrakeEnvPool::state_dim)
+      .def_property_readonly("control_dim", &DrakeEnvPool::control_dim)
+      .def_property_readonly("nthread", &DrakeEnvPool::nthread)
+      .def_property_readonly("workspace_count", &DrakeEnvPool::workspace_count)
       .def_property_readonly("num_filtered_geometries",
-                             &NativeDrakeEnvPool::num_filtered_geometries)
-      .def("step", &NativeDrakeEnvPool::step, py::arg("state0"), py::arg("nstep"),
+                             &DrakeEnvPool::num_filtered_geometries)
+      .def("step", &DrakeEnvPool::step, py::arg("state0"), py::arg("nstep"),
            py::arg("control"), py::arg("push_force") = py::none())
-      .def("reset", &NativeDrakeEnvPool::reset, py::arg("env_ids"), py::arg("initial_state"))
-      .def("snapshot", &NativeDrakeEnvPool::snapshot);
+      .def("reset", &DrakeEnvPool::reset, py::arg("env_ids"), py::arg("initial_state"))
+      .def("snapshot", &DrakeEnvPool::snapshot);
 }

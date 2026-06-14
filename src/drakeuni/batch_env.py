@@ -1,12 +1,9 @@
 from __future__ import annotations
 
-from .native import NativeDrakeEnvPool, native_available, native_import_error
-
-DrakeEnvPool = NativeDrakeEnvPool
+from .compiled import DrakeEnvPool, batch_available, batch_import_error
 
 __all__ = [
     "DrakeEnvPool",
-    "NativeDrakeEnvPool",
-    "native_available",
-    "native_import_error",
+    "batch_available",
+    "batch_import_error",
 ]

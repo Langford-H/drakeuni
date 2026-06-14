@@ -7,4 +7,4 @@ build/
 dist/
 *.egg-info/
 .DS_Store
-src/drakeuni/native/_drake_env_pool*.so
+src/drakeuni/compiled/_drake_env_pool*.so

@@ -8,8 +8,8 @@ import sysconfig
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-SOURCE = REPO_ROOT / "src/drakeuni/native/drake_env_pool.cc"
-OUTPUT_DIR = REPO_ROOT / "src/drakeuni/native"
+SOURCE = REPO_ROOT / "src/drakeuni/compiled/drake_env_pool.cc"
+OUTPUT_DIR = REPO_ROOT / "src/drakeuni/compiled"
 
 
 def _pkg_config_flags(package: str, option: str) -> list[str]:
