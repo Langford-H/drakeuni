@@ -9,14 +9,11 @@ import numpy as np
 
 from drakeuni.batch_env import DrakeEnvPool, batch_available, batch_import_error
 
-from .metadata import (
-    GO1_FOOT_CONTACT_SENSOR_NAMES,
-    GO1_FOOT_SENSOR_NAMES,
+from .mjcf_model_parser import (
     ROOT_QVEL_DIM,
-    body_index,
-    foot_metadata,
-    load_model_metadata,
+    parse_mjcf_model_contract,
     read_keyframe_qpos,
+    tracked_points_as_pool_inputs,
 )
 from .types import DrakeModelInfo, DrakeRuntimeConfig, DrakeRuntimeDiagnostics
 
@@ -25,8 +22,6 @@ class DrakeBatchRuntime:
     def __init__(self, config: DrakeRuntimeConfig) -> None:
         if config.mode != "batch":
             raise ValueError(f"DrakeBatchRuntime requires mode='batch', got {config.mode!r}")
-        if config.robot_profile != "go1":
-            raise ValueError(f"DrakeBatchRuntime currently supports only Go1, got {config.robot_profile!r}")
         if int(config.num_envs) < 1:
             raise ValueError(f"DrakeBatchRuntime requires num_envs >= 1, got {config.num_envs}")
         if DrakeEnvPool is None or not bool(batch_available()):
@@ -40,7 +35,7 @@ class DrakeBatchRuntime:
         self._num_envs = int(config.num_envs)
         self._sim_dt = float(config.sim_dt)
         self._model_file = str(Path(config.model_file).expanduser())
-        self._metadata = load_model_metadata(self._model_file)
+        self._model_contract = parse_mjcf_model_contract(self._model_file)
         home_qpos = read_keyframe_qpos(self._model_file, "home")
         if home_qpos is None:
             raise ValueError(f"DrakeBatchRuntime requires keyframe 'home' in {self._model_file}")
@@ -49,17 +44,17 @@ class DrakeBatchRuntime:
         self._kd = float(config.kd)
         self._nthread = _resolve_nthread(self._num_envs, int(config.nthread))
         push_body_name = config.push_body_name or config.base_name
-        foot_body_indices, foot_offsets = foot_metadata(self._metadata)
+        tracked_body_indices, tracked_offsets = tracked_points_as_pool_inputs(self._model_contract)
         self._pool = DrakeEnvPool(
             self._model_file,
             self._num_envs,
             self._sim_dt,
-            self._metadata.ctrl_limits,
-            self._metadata.torque_limits,
-            body_index(config.base_name),
-            body_index(push_body_name),
-            foot_body_indices,
-            foot_offsets,
+            self._model_contract.ctrl_limits,
+            self._model_contract.torque_limits,
+            self._model_contract.body_index(config.base_name),
+            self._model_contract.body_index(push_body_name),
+            tracked_body_indices,
+            tracked_offsets,
             self._kp,
             self._kd,
             self._nthread,
@@ -75,10 +70,10 @@ class DrakeBatchRuntime:
             nu=int(self._pool.control_dim),
             home_qpos=self._home_qpos.copy(),
             home_qvel=self._home_qvel.copy(),
-            ctrl_limits=self._metadata.ctrl_limits.copy(),
-            torque_limits=self._metadata.torque_limits.copy(),
-            joint_ranges=self._metadata.joint_ranges.copy(),
-            sensor_names=self._metadata.sensor_names,
+            ctrl_limits=self._model_contract.ctrl_limits.copy(),
+            torque_limits=self._model_contract.torque_limits.copy(),
+            joint_ranges=self._model_contract.joint_ranges.copy(),
+            sensor_names=self._model_contract.sensor_names,
         )
         self._physics_state = np.zeros((self._num_envs, int(self._pool.state_dim)), dtype=np.float64)
         self._sensor_packet: dict[str, np.ndarray] = {}
@@ -159,7 +154,10 @@ class DrakeBatchRuntime:
             raise KeyError(f"Unknown DrakeUni sensor: {name}") from exc
 
     def body_ids(self, names: list[str] | tuple[str, ...]) -> np.ndarray:
-        return np.asarray([body_index(str(name)) for name in names], dtype=np.int32)
+        return np.asarray(
+            [self._model_contract.body_index(str(name)) for name in names],
+            dtype=np.int32,
+        )
 
     def diagnostics(self) -> DrakeRuntimeDiagnostics:
         detail = batch_import_error()
@@ -196,14 +194,16 @@ class DrakeBatchRuntime:
         packet = {key: np.asarray(value, dtype=np.float64).copy() for key, value in raw_sensor.items()}
         feet_pos = packet.get("feet_pos")
         if feet_pos is not None:
-            for foot_index, sensor_name in enumerate(GO1_FOOT_SENSOR_NAMES):
-                if foot_index < feet_pos.shape[1]:
-                    packet[sensor_name] = feet_pos[:, foot_index, :]
+            for point_index, point in enumerate(self._model_contract.tracked_points):
+                if point_index < feet_pos.shape[1]:
+                    packet[point.name] = feet_pos[:, point_index, :]
         feet_contact = packet.get("feet_contact_force")
         if feet_contact is not None:
-            for foot_index, sensor_name in enumerate(GO1_FOOT_CONTACT_SENSOR_NAMES):
-                if foot_index < feet_contact.shape[1]:
-                    packet[sensor_name] = feet_contact[:, foot_index, :]
+            for sensor in self._model_contract.contact_sensors:
+                if sensor.tracked_index is not None and sensor.tracked_index < feet_contact.shape[1]:
+                    packet[sensor.name] = feet_contact[:, sensor.tracked_index, :]
+                else:
+                    packet[sensor.name] = np.zeros((self._num_envs, 3), dtype=np.float64)
         packet.setdefault("position", packet["base_pos"])
         self._sensor_packet = packet
 

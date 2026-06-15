@@ -17,7 +17,7 @@ class DrakeRuntimeConfig:
     kp: float = 35.0
     kd: float = 0.5
     nthread: int = 0
-    robot_profile: Literal["go1"] = "go1"
+    robot_profile: str = "go1"
 
 
 @dataclass(frozen=True)
