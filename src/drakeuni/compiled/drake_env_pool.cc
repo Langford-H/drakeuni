@@ -17,6 +17,7 @@
 #include "drake/geometry/collision_filter_declaration.h"
 #include "drake/geometry/geometry_set.h"
 #include "drake/math/rigid_transform.h"
+#include "drake/multibody/plant/contact_results.h"
 #include "drake/multibody/math/spatial_algebra.h"
 #include "drake/multibody/parsing/parser.h"
 #include "drake/multibody/plant/externally_applied_spatial_force.h"
@@ -41,6 +42,7 @@ using drake::geometry::GeometrySet;
 using drake::geometry::SceneGraph;
 using drake::math::RigidTransform;
 using drake::multibody::BodyIndex;
+using drake::multibody::ContactResults;
 using drake::multibody::ContactModel;
 using drake::multibody::DiscreteContactApproximation;
 using drake::multibody::ExternallyAppliedSpatialForce;
@@ -159,6 +161,7 @@ class DrakeEnvPool {
     scene_graph_ = &scene_graph_ref;
     plant_->set_contact_model(ContactModel::kPointContactOnly);
     plant_->set_discrete_contact_approximation(DiscreteContactApproximation::kSap);
+    plant_->set_penetration_allowance(1.0e-4);
     const auto model_instances = Parser(plant_).AddModels(model_file);
     if (model_instances.size() != 1) {
       throw std::runtime_error("DrakeEnvPool expected exactly one model instance");
@@ -456,6 +459,27 @@ class DrakeEnvPool {
       for (int axis = 0; axis < 3; ++axis) {
         feet_pos_view(env_index, point, axis) = p[axis];
         feet_contact_force_view(env_index, point, axis) = 0.0;
+      }
+    }
+
+    const auto& contact_results =
+        plant_->get_contact_results_output_port().Eval<ContactResults<double>>(
+            *runtime.plant_context);
+    for (int i = 0; i < contact_results.num_point_pair_contacts(); ++i) {
+      const auto& contact = contact_results.point_pair_contact_info(i);
+      for (int point = 0; point < static_cast<int>(tracked_bodies_.size()); ++point) {
+        const BodyIndex tracked_body = tracked_bodies_[point]->index();
+        Eigen::Vector3d force = Eigen::Vector3d::Zero();
+        if (contact.bodyA_index() == tracked_body) {
+          force = -contact.contact_force();
+        } else if (contact.bodyB_index() == tracked_body) {
+          force = contact.contact_force();
+        } else {
+          continue;
+        }
+        for (int axis = 0; axis < 3; ++axis) {
+          feet_contact_force_view(env_index, point, axis) += force[axis];
+        }
       }
     }
   }

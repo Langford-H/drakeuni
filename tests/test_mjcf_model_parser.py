@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 
 from drakeuni.runtime.mjcf_model_parser import (
+    materialize_drake_compatible_mjcf,
     parse_mjcf_model_contract,
     read_keyframe_qpos,
     tracked_points_as_pool_inputs,
@@ -83,3 +84,35 @@ def test_go2_scene_mjcf_model_parser_uses_geom_frames_and_joint_range_ctrl_fallb
     assert contacts["FL_foot_contact"].tracked_index == 1
     assert contacts["base1_contact"].tracked_index is None
     assert "base1_contact" in model_contract.sensor_names
+
+
+def test_go2_drake_compatible_mjcf_expands_physics_defaults() -> None:
+    scene = _asset("src/unilab/assets/robots/go2/scene_flat.xml")
+    materialized = materialize_drake_compatible_mjcf(scene)
+    try:
+        import xml.etree.ElementTree as ET
+
+        go2_xml = Path(materialized.model_file).parent / "go2.xml"
+        root = ET.parse(go2_xml).getroot()
+
+        visual_only_geoms = [
+            geom
+            for geom in root.findall(".//worldbody//geom")
+            if geom.attrib.get("contype") == "0" and geom.attrib.get("conaffinity") == "0"
+        ]
+        assert visual_only_geoms == []
+
+        joints = {joint.attrib["name"]: joint.attrib for joint in root.findall(".//worldbody//joint")}
+        assert joints["FL_hip_joint"]["axis"] == "1 0 0"
+        assert joints["FL_thigh_joint"]["axis"] == "0 1 0"
+        assert joints["FL_calf_joint"]["axis"] == "0 1 0"
+
+        foot = next(
+            geom for geom in root.findall(".//worldbody//geom") if geom.attrib.get("name") == "FL"
+        )
+        assert foot.attrib["size"] == "0.022"
+        assert foot.attrib["pos"] == "-0.002 0 -0.213"
+        assert foot.attrib["contype"] == "1"
+        assert foot.attrib["conaffinity"] == "2"
+    finally:
+        materialized.close()

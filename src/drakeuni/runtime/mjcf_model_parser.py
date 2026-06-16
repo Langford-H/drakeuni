@@ -4,6 +4,8 @@ import xml.etree.ElementTree as ET
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from shutil import copytree
+from tempfile import TemporaryDirectory
 
 import numpy as np
 
@@ -88,6 +90,17 @@ class MjcfFrameContract:
     offset: np.ndarray
 
 
+@dataclass
+class DrakeCompatibleMjcf:
+    model_file: str
+    tempdir: TemporaryDirectory[str] | None = None
+
+    def close(self) -> None:
+        if self.tempdir is not None:
+            self.tempdir.cleanup()
+            self.tempdir = None
+
+
 def parse_mjcf_model_contract(scene_path: str | Path) -> DrakeMjcfModelContract:
     path = Path(scene_path)
     roots = _load_xml_roots(path)
@@ -112,6 +125,35 @@ def parse_mjcf_model_contract(scene_path: str | Path) -> DrakeMjcfModelContract:
         joint_ranges=joint_ranges,
         tracked_points=tracked_points,
         contact_sensors=contact_sensors,
+    )
+
+
+def materialize_drake_compatible_mjcf(scene_path: str | Path) -> DrakeCompatibleMjcf:
+    """Write a temporary MJCF with inherited defaults expanded for Drake parsing.
+
+    MuJoCo resolves nested defaults and body ``childclass`` inheritance before
+    building the physical model. Drake's MJCF parser does not currently match
+    that behavior for all UniLab robot assets, so the batch runtime feeds Drake
+    a copy with joint/geom/site defaults made explicit. Visual-only geoms are
+    omitted from that copy because the batch runtime only needs physical
+    collision geometry.
+    """
+
+    source_scene = Path(scene_path).expanduser().resolve()
+    roots = _load_xml_roots(source_scene)
+    defaults = _collect_default_classes(roots)
+    tempdir = TemporaryDirectory(prefix="drakeuni_mjcf_")
+    temp_root = Path(tempdir.name)
+    source_root = source_scene.parent
+    copied_root = temp_root / source_root.name
+    copytree(source_root, copied_root, dirs_exist_ok=True)
+
+    for xml_path in copied_root.rglob("*.xml"):
+        _expand_mjcf_defaults_in_file(xml_path, defaults)
+
+    return DrakeCompatibleMjcf(
+        model_file=str(copied_root / source_scene.name),
+        tempdir=tempdir,
     )
 
 
@@ -181,6 +223,36 @@ def _unique(names: Sequence[str]) -> tuple[str, ...]:
         seen.add(name)
         out.append(name)
     return tuple(out)
+
+
+def _expand_mjcf_defaults_in_file(
+    path: Path,
+    defaults: dict[str, dict[str, dict[str, str]]],
+) -> None:
+    tree = ET.parse(path)
+    root = tree.getroot()
+
+    def walk_body(body: ET.Element, inherited_class: str | None) -> None:
+        element_class = body.attrib.get("childclass", inherited_class)
+        for child in list(body):
+            if child.tag in {"joint", "geom", "site"}:
+                class_name = child.attrib.get("class", element_class)
+                attrs = _merged_default_attrs(defaults, class_name, child.tag, child.attrib)
+                if child.tag == "geom" and _is_noncolliding_geom(attrs):
+                    body.remove(child)
+                    continue
+                child.attrib.clear()
+                child.attrib.update(attrs)
+            elif child.tag == "body":
+                walk_body(child, element_class)
+
+    for body in root.findall("./worldbody/body"):
+        walk_body(body, None)
+    tree.write(path, encoding="utf-8", xml_declaration=False)
+
+
+def _is_noncolliding_geom(attrs: dict[str, str]) -> bool:
+    return attrs.get("contype") == "0" and attrs.get("conaffinity") == "0"
 
 
 def _collect_default_classes(

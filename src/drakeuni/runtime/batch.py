@@ -11,6 +11,8 @@ from drakeuni.batch_env import DrakeEnvPool, batch_available, batch_import_error
 
 from .mjcf_model_parser import (
     ROOT_QVEL_DIM,
+    DrakeCompatibleMjcf,
+    materialize_drake_compatible_mjcf,
     parse_mjcf_model_contract,
     read_keyframe_qpos,
     tracked_points_as_pool_inputs,
@@ -36,6 +38,9 @@ class DrakeBatchRuntime:
         self._sim_dt = float(config.sim_dt)
         self._model_file = str(Path(config.model_file).expanduser())
         self._model_contract = parse_mjcf_model_contract(self._model_file)
+        self._drake_model: DrakeCompatibleMjcf = materialize_drake_compatible_mjcf(
+            self._model_file
+        )
         home_qpos = read_keyframe_qpos(self._model_file, "home")
         if home_qpos is None:
             raise ValueError(f"DrakeBatchRuntime requires keyframe 'home' in {self._model_file}")
@@ -48,7 +53,7 @@ class DrakeBatchRuntime:
             self._model_contract
         )
         self._pool = DrakeEnvPool(
-            self._model_file,
+            self._drake_model.model_file,
             self._num_envs,
             self._sim_dt,
             self._model_contract.ctrl_limits,
@@ -182,7 +187,7 @@ class DrakeBatchRuntime:
         }
 
     def close(self) -> None:
-        return None
+        self._drake_model.close()
 
     def _pack_state_rows(self, qpos: np.ndarray, qvel: np.ndarray) -> np.ndarray:
         state = np.zeros((qpos.shape[0], int(self._pool.state_dim)), dtype=np.float64)
