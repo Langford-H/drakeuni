@@ -127,15 +127,15 @@ class DrakeEnvPool {
                      py::array_t<double, py::array::c_style | py::array::forcecast> ctrl_limits,
                      py::array_t<double, py::array::c_style | py::array::forcecast> torque_limits,
                      int base_body_index, int push_body_index,
-                     const std::vector<int>& foot_body_indices,
-                     py::array_t<double, py::array::c_style | py::array::forcecast> foot_offsets,
+                     const std::vector<int>& tracked_body_indices,
+                     py::array_t<double, py::array::c_style | py::array::forcecast> tracked_point_offsets,
                      double kp, double kd, int nthread)
       : nbatch_(nbatch),
         sim_dt_(sim_dt),
         ctrl_limits_(std::move(ctrl_limits)),
         torque_limits_(std::move(torque_limits)),
-        foot_body_indices_(foot_body_indices),
-        foot_offsets_(std::move(foot_offsets)),
+        tracked_body_indices_(tracked_body_indices),
+        tracked_point_offsets_(std::move(tracked_point_offsets)),
         kp_(kp),
         kd_(kd) {
     if (nbatch_ < 1) {
@@ -148,8 +148,9 @@ class DrakeEnvPool {
     }
     nu_ = static_cast<int>(ctrl_info.shape[0]);
     RequireShape(torque_limits_.request(), {nu_}, "torque_limits");
-    RequireShape(foot_offsets_.request(), {static_cast<py::ssize_t>(foot_body_indices_.size()), 3},
-                 "foot_offsets");
+    RequireShape(tracked_point_offsets_.request(),
+                 {static_cast<py::ssize_t>(tracked_body_indices_.size()), 3},
+                 "tracked_point_offsets");
 
     DiagramBuilder<double> builder;
     auto [plant_ref, scene_graph_ref] =
@@ -171,15 +172,14 @@ class DrakeEnvPool {
       actuator.set_controller_gains(PdControllerGains(kp_, kd_));
     }
 
-    // Match the Go1 pydrake backend's MJCF collision topology: Drake's parser
-    // does not honor MuJoCo contype/conaffinity here, so exclude robot
-    // self-collisions before Finalize().
+    // Drake's MJCF parser does not honor MuJoCo contype/conaffinity here, so
+    // exclude robot self-collisions before Finalize().
     num_filtered_geometries_ = ExcludeRobotSelfCollisions();
     plant_->Finalize();
-    trunk_body_ = &plant_->get_body(BodyIndex(base_body_index));
+    base_body_ = &plant_->get_body(BodyIndex(base_body_index));
     push_body_ = &plant_->get_body(BodyIndex(push_body_index));
-    for (int foot_body_index : foot_body_indices_) {
-      foot_bodies_.push_back(&plant_->get_body(BodyIndex(foot_body_index)));
+    for (int tracked_body_index : tracked_body_indices_) {
+      tracked_bodies_.push_back(&plant_->get_body(BodyIndex(tracked_body_index)));
     }
     diagram_ = builder.Build();
 
@@ -239,8 +239,8 @@ class DrakeEnvPool {
     auto base_quat = MakeArray({nbatch_, 4});
     auto dof_pos = MakeArray({nbatch_, nu_});
     auto dof_vel = MakeArray({nbatch_, nu_});
-    auto feet_pos = MakeArray({nbatch_, static_cast<int>(foot_bodies_.size()), 3});
-    auto feet_contact_force = MakeArray({nbatch_, static_cast<int>(foot_bodies_.size()), 3});
+    auto feet_pos = MakeArray({nbatch_, static_cast<int>(tracked_bodies_.size()), 3});
+    auto feet_contact_force = MakeArray({nbatch_, static_cast<int>(tracked_bodies_.size()), 3});
 
     auto start = std::chrono::steady_clock::now();
     {
@@ -407,10 +407,10 @@ class DrakeEnvPool {
                     py::array_t<double>& dof_vel, py::array_t<double>& feet_pos,
                     py::array_t<double>& feet_contact_force) const {
     const RigidTransform<double> x_wb =
-        plant_->EvalBodyPoseInWorld(*runtime.plant_context, *trunk_body_);
+        plant_->EvalBodyPoseInWorld(*runtime.plant_context, *base_body_);
     const Eigen::Matrix3d r_bw = x_wb.rotation().matrix().transpose();
     const auto velocity_w =
-        plant_->EvalBodySpatialVelocityInWorld(*runtime.plant_context, *trunk_body_);
+        plant_->EvalBodySpatialVelocityInWorld(*runtime.plant_context, *base_body_);
     const Eigen::Vector3d gyro_b = r_bw * velocity_w.rotational();
     const Eigen::Vector3d linvel_b = r_bw * velocity_w.translational();
     auto gyro_view = gyro.mutable_unchecked<2>();
@@ -443,18 +443,19 @@ class DrakeEnvPool {
       dof_vel_view(env_index, i) = v[kRootQvelDim + i];
     }
 
-    auto foot_offsets = foot_offsets_.unchecked<2>();
+    auto tracked_point_offsets = tracked_point_offsets_.unchecked<2>();
     auto feet_pos_view = feet_pos.mutable_unchecked<3>();
     auto feet_contact_force_view = feet_contact_force.mutable_unchecked<3>();
-    for (int foot = 0; foot < static_cast<int>(foot_bodies_.size()); ++foot) {
+    for (int point = 0; point < static_cast<int>(tracked_bodies_.size()); ++point) {
       const RigidTransform<double> x_wf =
-          plant_->EvalBodyPoseInWorld(*runtime.plant_context, *foot_bodies_[foot]);
-      const Eigen::Vector3d offset(foot_offsets(foot, 0), foot_offsets(foot, 1),
-                                   foot_offsets(foot, 2));
+          plant_->EvalBodyPoseInWorld(*runtime.plant_context, *tracked_bodies_[point]);
+      const Eigen::Vector3d offset(tracked_point_offsets(point, 0),
+                                   tracked_point_offsets(point, 1),
+                                   tracked_point_offsets(point, 2));
       const Eigen::Vector3d p = x_wf.translation() + x_wf.rotation().matrix() * offset;
       for (int axis = 0; axis < 3; ++axis) {
-        feet_pos_view(env_index, foot, axis) = p[axis];
-        feet_contact_force_view(env_index, foot, axis) = 0.0;
+        feet_pos_view(env_index, point, axis) = p[axis];
+        feet_contact_force_view(env_index, point, axis) = 0.0;
       }
     }
   }
@@ -470,8 +471,8 @@ class DrakeEnvPool {
     auto base_quat = MakeArray({nbatch_, 4});
     auto dof_pos = MakeArray({nbatch_, nu_});
     auto dof_vel = MakeArray({nbatch_, nu_});
-    auto feet_pos = MakeArray({nbatch_, static_cast<int>(foot_bodies_.size()), 3});
-    auto feet_contact_force = MakeArray({nbatch_, static_cast<int>(foot_bodies_.size()), 3});
+    auto feet_pos = MakeArray({nbatch_, static_cast<int>(tracked_bodies_.size()), 3});
+    auto feet_contact_force = MakeArray({nbatch_, static_cast<int>(tracked_bodies_.size()), 3});
     {
       py::gil_scoped_release release;
       auto worker = [&](int thread_index, int begin, int end) {
@@ -559,8 +560,8 @@ class DrakeEnvPool {
   int state_dim_{};
   py::array_t<double> ctrl_limits_;
   py::array_t<double> torque_limits_;
-  std::vector<int> foot_body_indices_;
-  py::array_t<double> foot_offsets_;
+  std::vector<int> tracked_body_indices_;
+  py::array_t<double> tracked_point_offsets_;
   double kp_{};
   double kd_{};
   int nthread_{};
@@ -569,9 +570,9 @@ class DrakeEnvPool {
   MultibodyPlant<double>* plant_{};
   SceneGraph<double>* scene_graph_{};
   ModelInstanceIndex model_instance_;
-  const RigidBody<double>* trunk_body_{};
+  const RigidBody<double>* base_body_{};
   const RigidBody<double>* push_body_{};
-  std::vector<const RigidBody<double>*> foot_bodies_;
+  std::vector<const RigidBody<double>*> tracked_bodies_;
   std::vector<double> compact_state_;
   std::vector<ThreadWorkspace> workspaces_;
 };
@@ -581,7 +582,7 @@ bool BatchAvailable() { return true; }
 }  // namespace
 
 PYBIND11_MODULE(_drake_env_pool, m) {
-  m.doc() = "Optional compiled DrakeEnvPool for UniLab Go1 DrakeUni experiments.";
+  m.doc() = "Compiled DrakeEnvPool for UniLab DrakeUni batch experiments.";
   m.def("batch_available", &BatchAvailable);
   py::class_<DrakeEnvPool>(m, "DrakeEnvPool")
       .def(py::init<const std::string&, int, double,
@@ -592,7 +593,8 @@ PYBIND11_MODULE(_drake_env_pool, m) {
                     double, int>(),
            py::arg("model_file"), py::arg("nbatch"), py::arg("sim_dt"),
            py::arg("ctrl_limits"), py::arg("torque_limits"), py::arg("base_body_index"),
-           py::arg("push_body_index"), py::arg("foot_body_indices"), py::arg("foot_offsets"),
+           py::arg("push_body_index"), py::arg("tracked_body_indices"),
+           py::arg("tracked_point_offsets"),
            py::arg("kp"), py::arg("kd"), py::arg("nthread") = 1)
       .def_property_readonly("nbatch", &DrakeEnvPool::nbatch)
       .def_property_readonly("state_dim", &DrakeEnvPool::state_dim)

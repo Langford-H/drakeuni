@@ -12,12 +12,18 @@ class DrakeRuntimeConfig:
     num_envs: int
     sim_dt: float
     mode: Literal["batch", "debug"]
-    base_name: str = "trunk"
+    base_name: str
+    robot_profile: str
     push_body_name: str | None = None
     kp: float = 35.0
     kd: float = 0.5
     nthread: int = 0
-    robot_profile: str = "go1"
+
+    def __post_init__(self) -> None:
+        if not self.base_name:
+            raise ValueError("DrakeRuntimeConfig requires a task-provided base_name")
+        if not self.robot_profile:
+            raise ValueError("DrakeRuntimeConfig requires a task-provided robot_profile")
 
 
 @dataclass(frozen=True)

@@ -25,7 +25,7 @@ def create_runtime(config: DrakeRuntimeConfig):
     if config.mode == "debug":
         raise NotImplementedError(
             "DrakeUni debug runtime has not been migrated yet; UniLab still owns "
-            "pydrake debug/replay in this Go1 batch-runtime migration."
+            "pydrake debug/replay while DrakeUni exposes the batch runtime."
         )
     raise ValueError(f"Unknown Drake runtime mode: {config.mode!r}")
 

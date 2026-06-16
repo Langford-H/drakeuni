@@ -44,7 +44,9 @@ class DrakeBatchRuntime:
         self._kd = float(config.kd)
         self._nthread = _resolve_nthread(self._num_envs, int(config.nthread))
         push_body_name = config.push_body_name or config.base_name
-        tracked_body_indices, tracked_offsets = tracked_points_as_pool_inputs(self._model_contract)
+        tracked_body_indices, tracked_point_offsets = tracked_points_as_pool_inputs(
+            self._model_contract
+        )
         self._pool = DrakeEnvPool(
             self._model_file,
             self._num_envs,
@@ -54,7 +56,7 @@ class DrakeBatchRuntime:
             self._model_contract.body_index(config.base_name),
             self._model_contract.body_index(push_body_name),
             tracked_body_indices,
-            tracked_offsets,
+            tracked_point_offsets,
             self._kp,
             self._kd,
             self._nthread,

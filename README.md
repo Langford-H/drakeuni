@@ -1,16 +1,17 @@
 # DrakeUni
 
-Experimental Drake batch simulation runtime extracted from the UniLab Go1 Drake backend.
+Experimental Drake batch simulation runtime for UniLab's Drake backend adapter.
 
 Current scope:
 
-- Go1-only compiled C++/pybind batch pool.
+- Compiled C++/pybind batch pool driven by parsed MJCF model contracts.
 - `nbatch` and `nthread` worker control.
 - Python API modeled after MuJoCoUni's `BatchEnvPool` direction.
 - Intended to be consumed by UniLab's Drake backend adapter.
 
-This is not a generic Drake backend yet. The next design step is to remove the
-remaining Go1 metadata arguments from the low-level pool constructor.
+This is not a full Drake backend yet. The current runtime expects UniLab tasks
+to provide the model file, base body name, robot profile label, PD gains, and
+worker count.
 
 ## Build Batch Extension
 
@@ -39,10 +40,12 @@ runtime = create_runtime(
         num_envs=32,
         sim_dt=0.002,
         mode="batch",
+        base_name="base",
+        robot_profile="my_robot",
         nthread=8,
     )
 )
 ```
 
 The preferred integration point is `drakeuni.runtime`. `DrakeEnvPool` and
-UniLab is being cut over to the runtime protocol.
+the compiled extension are lower-level implementation details.
