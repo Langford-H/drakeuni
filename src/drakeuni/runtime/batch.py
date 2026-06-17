@@ -62,6 +62,11 @@ class DrakeBatchRuntime:
             self._model_contract.body_index(push_body_name),
             tracked_body_indices,
             tracked_point_offsets,
+            self._model_contract.sensor_type,
+            self._model_contract.sensor_index,
+            self._model_contract.sensor_adr,
+            self._model_contract.sensor_dim,
+            self._model_contract.nsensordata,
             self._kp,
             self._kd,
             self._nthread,
@@ -81,9 +86,15 @@ class DrakeBatchRuntime:
             torque_limits=self._model_contract.torque_limits.copy(),
             joint_ranges=self._model_contract.joint_ranges.copy(),
             sensor_names=self._model_contract.sensor_names,
+            sensor_adr=self._model_contract.sensor_adr.copy(),
+            sensor_dim=self._model_contract.sensor_dim.copy(),
+            nsensordata=self._model_contract.nsensordata,
         )
         self._physics_state = np.zeros((self._num_envs, int(self._pool.state_dim)), dtype=np.float64)
-        self._sensor_packet: dict[str, np.ndarray] = {}
+        self._sensor_data = np.zeros(
+            (self._num_envs, self._model_info.nsensordata),
+            dtype=np.float64,
+        )
         qpos = np.broadcast_to(self._home_qpos, (self._num_envs, self._model_info.nq)).copy()
         qvel = np.zeros((self._num_envs, self._model_info.nv), dtype=np.float64)
         self.reset(np.arange(self._num_envs, dtype=np.int32), qpos, qvel)
@@ -112,6 +123,9 @@ class DrakeBatchRuntime:
             torque_limits=info.torque_limits.copy(),
             joint_ranges=info.joint_ranges.copy(),
             sensor_names=info.sensor_names,
+            sensor_adr=info.sensor_adr.copy(),
+            sensor_dim=info.sensor_dim.copy(),
+            nsensordata=info.nsensordata,
         )
 
     def reset(self, env_ids: np.ndarray, qpos: np.ndarray, qvel: np.ndarray) -> None:
@@ -128,6 +142,7 @@ class DrakeBatchRuntime:
             raise ValueError(f"qvel must have shape ({indices.size}, {self._model_info.nv})")
         output = self._pool.reset(indices, self._pack_state_rows(qpos_rows, qvel_rows))
         self._apply_output(output)
+        self._refresh_sensor_data()
 
     def step(
         self,
@@ -145,20 +160,44 @@ class DrakeBatchRuntime:
             raise ValueError(f"push_force must have shape ({self._num_envs}, 3), got {push.shape}")
         output = self._pool.step(self._physics_state, int(nsteps), values, push)
         self._apply_output(output)
+        self._refresh_sensor_data()
         return {
             "state": self.physics_state(),
-            "sensor": {name: values.copy() for name, values in self._sensor_packet.items()},
+            "sensor_data": self.sensor_data(),
             "timing": dict(output.get("timing", {})),
         }
 
     def physics_state(self) -> np.ndarray:
         return self._physics_state.copy()
 
+    def sensor_data(self) -> np.ndarray:
+        return self._sensor_data.copy()
+
+    def forward(self, state: np.ndarray | None = None) -> np.ndarray:
+        values = self._physics_state if state is None else np.asarray(state, dtype=np.float64)
+        if values.shape != (self._num_envs, int(self._pool.state_dim)):
+            raise ValueError(
+                f"state must have shape ({self._num_envs}, {int(self._pool.state_dim)}), "
+                f"got {values.shape}"
+            )
+        return np.asarray(self._pool.forward(values), dtype=np.float64).copy()
+
+    def compute_body_state(
+        self,
+        body_ids: np.ndarray | list[int] | tuple[int, ...],
+    ) -> dict[str, np.ndarray]:
+        ids = np.asarray(body_ids, dtype=np.int32)
+        output = self._pool.compute_body_state(self._physics_state, ids)
+        return {name: np.asarray(value, dtype=np.float64).copy() for name, value in output.items()}
+
     def sensor(self, name: str) -> np.ndarray:
         try:
-            return self._sensor_packet[name].copy()
-        except KeyError as exc:
+            index = self._model_info.sensor_names.index(name)
+        except ValueError as exc:
             raise KeyError(f"Unknown DrakeUni sensor: {name}") from exc
+        adr = int(self._model_info.sensor_adr[index])
+        dim = int(self._model_info.sensor_dim[index])
+        return self._sensor_data[:, adr : adr + dim].copy()
 
     def body_ids(self, names: list[str] | tuple[str, ...]) -> np.ndarray:
         return np.asarray(
@@ -197,22 +236,9 @@ class DrakeBatchRuntime:
 
     def _apply_output(self, output: dict[str, Any]) -> None:
         self._physics_state = np.asarray(output["state"], dtype=np.float64).copy()
-        raw_sensor = output.get("sensor", {})
-        packet = {key: np.asarray(value, dtype=np.float64).copy() for key, value in raw_sensor.items()}
-        feet_pos = packet.get("feet_pos")
-        if feet_pos is not None:
-            for point_index, point in enumerate(self._model_contract.tracked_points):
-                if point_index < feet_pos.shape[1]:
-                    packet[point.name] = feet_pos[:, point_index, :]
-        feet_contact = packet.get("feet_contact_force")
-        if feet_contact is not None:
-            for sensor in self._model_contract.contact_sensors:
-                if sensor.tracked_index is not None and sensor.tracked_index < feet_contact.shape[1]:
-                    packet[sensor.name] = feet_contact[:, sensor.tracked_index, :]
-                else:
-                    packet[sensor.name] = np.zeros((self._num_envs, 3), dtype=np.float64)
-        packet.setdefault("position", packet["base_pos"])
-        self._sensor_packet = packet
+
+    def _refresh_sensor_data(self) -> None:
+        self._sensor_data = self.forward()
 
 
 def _resolve_nthread(num_envs: int, requested: int) -> int:

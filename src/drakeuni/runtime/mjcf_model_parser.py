@@ -31,6 +31,32 @@ BASE_SENSOR_NAMES = frozenset(
 )
 
 
+SENSOR_KIND_GYRO = 0
+SENSOR_KIND_LOCAL_LINVEL = 1
+SENSOR_KIND_GLOBAL_LINVEL = 2
+SENSOR_KIND_GLOBAL_ANGVEL = 3
+SENSOR_KIND_BASE_POSITION = 4
+SENSOR_KIND_UPVECTOR = 5
+SENSOR_KIND_BASE_QUAT = 6
+SENSOR_KIND_DOF_POS = 7
+SENSOR_KIND_DOF_VEL = 8
+SENSOR_KIND_TRACKED_FRAME_POS = 9
+SENSOR_KIND_CONTACT_FORCE = 10
+
+BASE_SENSOR_KIND = {
+    "gyro": SENSOR_KIND_GYRO,
+    "local_linvel": SENSOR_KIND_LOCAL_LINVEL,
+    "global_linvel": SENSOR_KIND_GLOBAL_LINVEL,
+    "global_angvel": SENSOR_KIND_GLOBAL_ANGVEL,
+    "position": SENSOR_KIND_BASE_POSITION,
+    "base_pos": SENSOR_KIND_BASE_POSITION,
+    "upvector": SENSOR_KIND_UPVECTOR,
+    "base_quat": SENSOR_KIND_BASE_QUAT,
+    "dof_pos": SENSOR_KIND_DOF_POS,
+    "dof_vel": SENSOR_KIND_DOF_VEL,
+}
+
+
 @dataclass(frozen=True)
 class MjcfTrackedPointContract:
     name: str
@@ -68,12 +94,65 @@ class DrakeMjcfModelContract:
                 "base_quat",
                 "dof_pos",
                 "dof_vel",
-                "feet_pos",
-                "feet_contact_force",
                 *(point.name for point in self.tracked_points),
                 *(sensor.name for sensor in self.contact_sensors),
             )
         )
+
+    @property
+    def sensor_dim(self) -> np.ndarray:
+        dims: list[int] = []
+        nu = int(self.ctrl_limits.shape[0])
+        for name in self.sensor_names:
+            if name in {"base_quat"}:
+                dims.append(4)
+            elif name in {"dof_pos", "dof_vel"}:
+                dims.append(nu)
+            else:
+                dims.append(3)
+        return np.asarray(dims, dtype=np.int32)
+
+    @property
+    def sensor_adr(self) -> np.ndarray:
+        dims = self.sensor_dim
+        return np.concatenate(
+            [np.asarray([0], dtype=np.int32), np.cumsum(dims[:-1], dtype=np.int32)]
+        )
+
+    @property
+    def nsensordata(self) -> int:
+        return int(np.sum(self.sensor_dim))
+
+    @property
+    def sensor_type(self) -> np.ndarray:
+        tracked_index = {point.name: i for i, point in enumerate(self.tracked_points)}
+        contact_index = {sensor.name: sensor.tracked_index for sensor in self.contact_sensors}
+        kinds: list[int] = []
+        for name in self.sensor_names:
+            if name in BASE_SENSOR_KIND:
+                kinds.append(BASE_SENSOR_KIND[name])
+            elif name in tracked_index:
+                kinds.append(SENSOR_KIND_TRACKED_FRAME_POS)
+            elif name in contact_index:
+                kinds.append(SENSOR_KIND_CONTACT_FORCE)
+            else:  # pragma: no cover - guarded by parser construction.
+                raise ValueError(f"Unknown DrakeUni MJCF sensor {name!r}")
+        return np.asarray(kinds, dtype=np.int32)
+
+    @property
+    def sensor_index(self) -> np.ndarray:
+        tracked_index = {point.name: i for i, point in enumerate(self.tracked_points)}
+        contact_index = {sensor.name: sensor.tracked_index for sensor in self.contact_sensors}
+        indices: list[int] = []
+        for name in self.sensor_names:
+            if name in tracked_index:
+                indices.append(tracked_index[name])
+            elif name in contact_index:
+                value = contact_index[name]
+                indices.append(-1 if value is None else int(value))
+            else:
+                indices.append(-1)
+        return np.asarray(indices, dtype=np.int32)
 
     def body_index(self, name: str) -> int:
         try:

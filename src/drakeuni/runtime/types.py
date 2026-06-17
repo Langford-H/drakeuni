@@ -49,3 +49,6 @@ class DrakeModelInfo:
     torque_limits: np.ndarray
     joint_ranges: np.ndarray
     sensor_names: tuple[str, ...]
+    sensor_adr: np.ndarray
+    sensor_dim: np.ndarray
+    nsensordata: int
