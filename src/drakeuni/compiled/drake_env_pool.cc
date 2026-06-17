@@ -247,7 +247,8 @@ class DrakeEnvPool {
   py::dict step(py::array_t<double, py::array::c_style | py::array::forcecast> state0,
                 int nstep,
                 py::array_t<double, py::array::c_style | py::array::forcecast> control,
-                py::object push_force) {
+                py::object push_force,
+                bool return_sensor) {
     if (nstep < 1) {
       throw std::invalid_argument("nstep must be >= 1");
     }
@@ -270,6 +271,10 @@ class DrakeEnvPool {
     }
 
     auto state_out = MakeArray({nbatch_, state_dim_});
+    py::array_t<double> sensor_data;
+    if (return_sensor) {
+      sensor_data = MakeArray({nbatch_, nsensordata_});
+    }
     auto start = std::chrono::steady_clock::now();
     {
       py::gil_scoped_release release;
@@ -279,6 +284,9 @@ class DrakeEnvPool {
           StepOne(workspace, env_index, state0, control, control_is_traj, nstep,
                   has_push ? &push_array : nullptr);
           WriteState(workspace, env_index, state_out);
+          if (return_sensor) {
+            WriteSensorRow(workspace, env_index, sensor_data);
+          }
         }
       };
       RunChunks(worker);
@@ -291,12 +299,16 @@ class DrakeEnvPool {
     timing["step_ms"] = step_ms;
     py::dict output;
     output["state"] = state_out;
+    if (return_sensor) {
+      output["sensor_data"] = sensor_data;
+    }
     output["timing"] = timing;
     return output;
   }
 
   py::dict reset(py::array_t<int, py::array::c_style | py::array::forcecast> env_ids,
-                 py::array_t<double, py::array::c_style | py::array::forcecast> initial_state) {
+                 py::array_t<double, py::array::c_style | py::array::forcecast> initial_state,
+                 bool return_sensor) {
     auto ids_info = env_ids.request();
     if (ids_info.ndim != 1) {
       throw std::invalid_argument("env_ids must be one-dimensional");
@@ -315,29 +327,10 @@ class DrakeEnvPool {
         SaveCompactState(env_index, &state(row, 0));
       }
     }
-    return Snapshot();
+    return Snapshot(return_sensor);
   }
 
-  py::dict snapshot() { return Snapshot(); }
-
-  py::array_t<double> forward(
-      py::array_t<double, py::array::c_style | py::array::forcecast> state0) {
-    RequireShape(state0.request(), {nbatch_, state_dim_}, "state0");
-    auto sensor_data = MakeArray({nbatch_, nsensordata_});
-    {
-      py::gil_scoped_release release;
-      auto worker = [&](int thread_index, int begin, int end) {
-        auto& workspace = workspaces_.at(thread_index);
-        auto state = state0.unchecked<2>();
-        for (int env_index = begin; env_index < end; ++env_index) {
-          LoadState(workspace, &state(env_index, 0));
-          WriteSensorRow(workspace, env_index, sensor_data);
-        }
-      };
-      RunChunks(worker);
-    }
-    return sensor_data;
-  }
+  py::dict snapshot(bool return_sensor) { return Snapshot(return_sensor); }
 
   py::dict compute_body_state(
       py::array_t<double, py::array::c_style | py::array::forcecast> state0,
@@ -659,8 +652,12 @@ class DrakeEnvPool {
     }
   }
 
-  py::dict Snapshot() {
+  py::dict Snapshot(bool return_sensor) {
     auto state_out = MakeArray({nbatch_, state_dim_});
+    py::array_t<double> sensor_data;
+    if (return_sensor) {
+      sensor_data = MakeArray({nbatch_, nsensordata_});
+    }
     {
       py::gil_scoped_release release;
       auto worker = [&](int thread_index, int begin, int end) {
@@ -668,12 +665,18 @@ class DrakeEnvPool {
         for (int env_index = begin; env_index < end; ++env_index) {
           LoadState(workspace, CompactStateRow(env_index));
           WriteState(workspace, env_index, state_out);
+          if (return_sensor) {
+            WriteSensorRow(workspace, env_index, sensor_data);
+          }
         }
       };
       RunChunks(worker);
     }
     py::dict output;
     output["state"] = state_out;
+    if (return_sensor) {
+      output["sensor_data"] = sensor_data;
+    }
     return output;
   }
 
@@ -788,10 +791,11 @@ PYBIND11_MODULE(_drake_env_pool, m) {
       .def_property_readonly("num_filtered_geometries",
                              &DrakeEnvPool::num_filtered_geometries)
       .def("step", &DrakeEnvPool::step, py::arg("state0"), py::arg("nstep"),
-           py::arg("control"), py::arg("push_force") = py::none())
-      .def("forward", &DrakeEnvPool::forward, py::arg("state0"))
+           py::arg("control"), py::arg("push_force") = py::none(),
+           py::arg("return_sensor") = false)
       .def("compute_body_state", &DrakeEnvPool::compute_body_state, py::arg("state0"),
            py::arg("body_indices"))
-      .def("reset", &DrakeEnvPool::reset, py::arg("env_ids"), py::arg("initial_state"))
-      .def("snapshot", &DrakeEnvPool::snapshot);
+      .def("reset", &DrakeEnvPool::reset, py::arg("env_ids"), py::arg("initial_state"),
+           py::arg("return_sensor") = false)
+      .def("snapshot", &DrakeEnvPool::snapshot, py::arg("return_sensor") = false);
 }

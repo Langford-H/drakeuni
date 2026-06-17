@@ -140,9 +140,9 @@ class DrakeBatchRuntime:
             raise ValueError(f"qpos must have shape ({indices.size}, {self._model_info.nq})")
         if qvel_rows.shape != (indices.size, self._model_info.nv):
             raise ValueError(f"qvel must have shape ({indices.size}, {self._model_info.nv})")
-        output = self._pool.reset(indices, self._pack_state_rows(qpos_rows, qvel_rows))
+        output = self._pool.reset(indices, self._pack_state_rows(qpos_rows, qvel_rows), True)
         self._apply_output(output)
-        self._refresh_sensor_data()
+        self._apply_sensor_data(output)
 
     def step(
         self,
@@ -158,9 +158,9 @@ class DrakeBatchRuntime:
         push = None if push_force is None else np.asarray(push_force, dtype=np.float64)
         if push is not None and push.shape != (self._num_envs, 3):
             raise ValueError(f"push_force must have shape ({self._num_envs}, 3), got {push.shape}")
-        output = self._pool.step(self._physics_state, int(nsteps), values, push)
+        output = self._pool.step(self._physics_state, int(nsteps), values, push, True)
         self._apply_output(output)
-        self._refresh_sensor_data()
+        self._apply_sensor_data(output)
         return {
             "state": self.physics_state(),
             "sensor_data": self.sensor_data(),
@@ -172,15 +172,6 @@ class DrakeBatchRuntime:
 
     def sensor_data(self) -> np.ndarray:
         return self._sensor_data.copy()
-
-    def forward(self, state: np.ndarray | None = None) -> np.ndarray:
-        values = self._physics_state if state is None else np.asarray(state, dtype=np.float64)
-        if values.shape != (self._num_envs, int(self._pool.state_dim)):
-            raise ValueError(
-                f"state must have shape ({self._num_envs}, {int(self._pool.state_dim)}), "
-                f"got {values.shape}"
-            )
-        return np.asarray(self._pool.forward(values), dtype=np.float64).copy()
 
     def compute_body_state(
         self,
@@ -237,8 +228,16 @@ class DrakeBatchRuntime:
     def _apply_output(self, output: dict[str, Any]) -> None:
         self._physics_state = np.asarray(output["state"], dtype=np.float64).copy()
 
-    def _refresh_sensor_data(self) -> None:
-        self._sensor_data = self.forward()
+    def _apply_sensor_data(self, output: dict[str, Any]) -> None:
+        if "sensor_data" not in output:
+            raise RuntimeError("DrakeEnvPool output did not include sensor_data")
+        sensor_data = np.asarray(output["sensor_data"], dtype=np.float64)
+        expected_shape = (self._num_envs, self._model_info.nsensordata)
+        if sensor_data.shape != expected_shape:
+            raise RuntimeError(
+                f"DrakeEnvPool sensor_data must have shape {expected_shape}, got {sensor_data.shape}"
+            )
+        self._sensor_data = sensor_data.copy()
 
 
 def _resolve_nthread(num_envs: int, requested: int) -> int:
