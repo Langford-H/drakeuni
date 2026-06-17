@@ -15,15 +15,13 @@ from .mjcf_model_parser import (
     materialize_drake_compatible_mjcf,
     parse_mjcf_model_contract,
     read_keyframe_qpos,
-    tracked_points_as_pool_inputs,
+    sensor_frames_as_pool_inputs,
 )
-from .types import DrakeModelInfo, DrakeRuntimeConfig, DrakeRuntimeDiagnostics
+from .types import DrakeBatchConfig, DrakeModelInfo, DrakeRuntimeDiagnostics
 
 
 class DrakeBatchRuntime:
-    def __init__(self, config: DrakeRuntimeConfig) -> None:
-        if config.mode != "batch":
-            raise ValueError(f"DrakeBatchRuntime requires mode='batch', got {config.mode!r}")
+    def __init__(self, config: DrakeBatchConfig) -> None:
         if int(config.num_envs) < 1:
             raise ValueError(f"DrakeBatchRuntime requires num_envs >= 1, got {config.num_envs}")
         if DrakeEnvPool is None or not bool(batch_available()):
@@ -45,11 +43,8 @@ class DrakeBatchRuntime:
         if home_qpos is None:
             raise ValueError(f"DrakeBatchRuntime requires keyframe 'home' in {self._model_file}")
         self._home_qpos = np.asarray(home_qpos, dtype=np.float64).copy()
-        self._kp = float(config.kp)
-        self._kd = float(config.kd)
         self._nthread = _resolve_nthread(self._num_envs, int(config.nthread))
-        push_body_name = config.push_body_name or config.base_name
-        tracked_body_indices, tracked_point_offsets = tracked_points_as_pool_inputs(
+        sensor_frame_body_indices, sensor_frame_offsets = sensor_frames_as_pool_inputs(
             self._model_contract
         )
         self._pool = DrakeEnvPool(
@@ -58,17 +53,15 @@ class DrakeBatchRuntime:
             self._sim_dt,
             self._model_contract.ctrl_limits,
             self._model_contract.torque_limits,
-            self._model_contract.body_index(config.base_name),
-            self._model_contract.body_index(push_body_name),
-            tracked_body_indices,
-            tracked_point_offsets,
+            self._model_contract.actuator_stiffness,
+            self._model_contract.actuator_damping,
+            sensor_frame_body_indices,
+            sensor_frame_offsets,
             self._model_contract.sensor_type,
             self._model_contract.sensor_index,
             self._model_contract.sensor_adr,
             self._model_contract.sensor_dim,
             self._model_contract.nsensordata,
-            self._kp,
-            self._kd,
             self._nthread,
         )
 
@@ -84,7 +77,10 @@ class DrakeBatchRuntime:
             home_qvel=self._home_qvel.copy(),
             ctrl_limits=self._model_contract.ctrl_limits.copy(),
             torque_limits=self._model_contract.torque_limits.copy(),
+            actuator_stiffness=self._model_contract.actuator_stiffness.copy(),
+            actuator_damping=self._model_contract.actuator_damping.copy(),
             joint_ranges=self._model_contract.joint_ranges.copy(),
+            num_bodies=int(self._pool.num_bodies),
             sensor_names=self._model_contract.sensor_names,
             sensor_adr=self._model_contract.sensor_adr.copy(),
             sensor_dim=self._model_contract.sensor_dim.copy(),
@@ -121,7 +117,10 @@ class DrakeBatchRuntime:
             home_qvel=info.home_qvel.copy(),
             ctrl_limits=info.ctrl_limits.copy(),
             torque_limits=info.torque_limits.copy(),
+            actuator_stiffness=info.actuator_stiffness.copy(),
+            actuator_damping=info.actuator_damping.copy(),
             joint_ranges=info.joint_ranges.copy(),
+            num_bodies=info.num_bodies,
             sensor_names=info.sensor_names,
             sensor_adr=info.sensor_adr.copy(),
             sensor_dim=info.sensor_dim.copy(),
@@ -148,17 +147,18 @@ class DrakeBatchRuntime:
         self,
         ctrl: np.ndarray,
         nsteps: int,
-        push_force: np.ndarray | None = None,
+        body_forces: np.ndarray | None = None,
     ) -> dict[str, Any]:
         values = np.asarray(ctrl, dtype=np.float64)
         if values.shape != (self._num_envs, self._model_info.nu):
             raise ValueError(
                 f"ctrl must have shape ({self._num_envs}, {self._model_info.nu}), got {values.shape}"
             )
-        push = None if push_force is None else np.asarray(push_force, dtype=np.float64)
-        if push is not None and push.shape != (self._num_envs, 3):
-            raise ValueError(f"push_force must have shape ({self._num_envs}, 3), got {push.shape}")
-        output = self._pool.step(self._physics_state, int(nsteps), values, push, True)
+        forces = None if body_forces is None else np.asarray(body_forces, dtype=np.float64)
+        expected_force_shape = (self._num_envs, self._model_info.num_bodies, 3)
+        if forces is not None and forces.shape != expected_force_shape:
+            raise ValueError(f"body_forces must have shape {expected_force_shape}, got {forces.shape}")
+        output = self._pool.step(self._physics_state, int(nsteps), values, forces, True)
         self._apply_output(output)
         self._apply_sensor_data(output)
         return {

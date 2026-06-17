@@ -5,8 +5,8 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .batch_env import DrakeEnvPool, batch_available, batch_import_error
     from .runtime import (
+        DrakeBatchConfig,
         DrakeModelInfo,
-        DrakeRuntimeConfig,
         DrakeRuntimeDiagnostics,
         available_backends,
         create_runtime,
@@ -14,8 +14,8 @@ if TYPE_CHECKING:
 
 __all__ = [
     "DrakeEnvPool",
+    "DrakeBatchConfig",
     "DrakeModelInfo",
-    "DrakeRuntimeConfig",
     "DrakeRuntimeDiagnostics",
     "available_backends",
     "batch_available",
@@ -31,7 +31,7 @@ def __getattr__(name: str):
         return getattr(batch_env, name)
     if name in {
         "DrakeModelInfo",
-        "DrakeRuntimeConfig",
+        "DrakeBatchConfig",
         "DrakeRuntimeDiagnostics",
         "available_backends",
         "create_runtime",

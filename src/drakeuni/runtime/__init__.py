@@ -1,8 +1,15 @@
+"""Python-facing DrakeUni runtime interface.
+
+UniLab should enter DrakeUni through this package. The runtime layer validates
+configuration, builds the batch runtime, exposes diagnostics, and keeps the C++
+extension behind a stable Python API.
+"""
+
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from .types import DrakeModelInfo, DrakeRuntimeConfig, DrakeRuntimeDiagnostics
+from .types import DrakeBatchConfig, DrakeModelInfo, DrakeRuntimeDiagnostics
 
 if TYPE_CHECKING:
     from .batch import DrakeBatchRuntime
@@ -17,17 +24,10 @@ def available_backends() -> dict[str, bool]:
     }
 
 
-def create_runtime(config: DrakeRuntimeConfig):
-    if config.mode == "batch":
-        from .batch import DrakeBatchRuntime
+def create_runtime(config: DrakeBatchConfig):
+    from .batch import DrakeBatchRuntime
 
-        return DrakeBatchRuntime(config)
-    if config.mode == "debug":
-        raise NotImplementedError(
-            "DrakeUni debug runtime has not been migrated yet; UniLab still owns "
-            "pydrake debug/replay while DrakeUni exposes the batch runtime."
-        )
-    raise ValueError(f"Unknown Drake runtime mode: {config.mode!r}")
+    return DrakeBatchRuntime(config)
 
 
 def batch_diagnostics() -> DrakeRuntimeDiagnostics:
@@ -44,8 +44,8 @@ def batch_diagnostics() -> DrakeRuntimeDiagnostics:
 
 __all__ = [
     "DrakeBatchRuntime",
+    "DrakeBatchConfig",
     "DrakeModelInfo",
-    "DrakeRuntimeConfig",
     "DrakeRuntimeDiagnostics",
     "available_backends",
     "batch_diagnostics",

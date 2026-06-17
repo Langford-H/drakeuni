@@ -11,7 +11,6 @@ from drakeuni.runtime.mjcf_model_parser import (
     materialize_drake_compatible_mjcf,
     parse_mjcf_model_contract,
     read_keyframe_qpos,
-    tracked_points_as_pool_inputs,
 )
 
 UNILAB_ROOT = Path("/Users/huanghaochen/solver/unilab/UniLab")
@@ -35,16 +34,21 @@ def test_go1_drake_scene_mjcf_model_parser_discovers_contract() -> None:
     assert model_contract.joint_ranges.shape == (12, 2)
     assert read_keyframe_qpos(scene, "home").shape == (19,)
 
-    tracked_names = [point.name for point in model_contract.tracked_points]
-    assert tracked_names == ["FR_pos", "FL_pos", "RR_pos", "RL_pos"]
-    body_indices, offsets = tracked_points_as_pool_inputs(model_contract)
+    frame_position_names = [point.name for point in model_contract.frame_position_sensors]
+    assert frame_position_names == ["position", "FR_pos", "FL_pos", "RR_pos", "RL_pos"]
+    body_indices = [point.body_index for point in model_contract.frame_position_sensors]
+    offsets = np.asarray([point.offset for point in model_contract.frame_position_sensors])
     assert body_indices == [
+        model_contract.body_index("trunk"),
         model_contract.body_index("FR_calf"),
         model_contract.body_index("FL_calf"),
         model_contract.body_index("RR_calf"),
         model_contract.body_index("RL_calf"),
     ]
-    np.testing.assert_allclose(offsets, np.tile([0.0, 0.0, -0.213], (4, 1)))
+    np.testing.assert_allclose(
+        offsets,
+        np.vstack(([0.0, 0.0, 0.0], np.tile([0.0, 0.0, -0.213], (4, 1)))),
+    )
 
     contact_names = [sensor.name for sensor in model_contract.contact_sensors]
     assert contact_names == [
@@ -60,6 +64,14 @@ def test_go1_drake_scene_mjcf_model_parser_discovers_contract() -> None:
     sensor_dims = dict(zip(model_contract.sensor_names, model_contract.sensor_dim, strict=True))
     assert sensor_dims["FL_foot_contact"] == 3
     assert "global_position" not in model_contract.sensor_names
+    assert model_contract.sensor_names[:6] == (
+        "gyro",
+        "local_linvel",
+        "position",
+        "upvector",
+        "global_linvel",
+        "global_angvel",
+    )
 
 
 def test_go2_scene_mjcf_model_parser_uses_geom_frames_and_joint_range_ctrl_fallback() -> None:
@@ -73,34 +85,42 @@ def test_go2_scene_mjcf_model_parser_uses_geom_frames_and_joint_range_ctrl_fallb
     np.testing.assert_allclose(model_contract.torque_limits[[0, 2]], [23.7, 45.43])
     assert read_keyframe_qpos(scene, "home").shape == (19,)
 
-    tracked_names = [point.name for point in model_contract.tracked_points]
-    assert tracked_names == ["FR_pos", "FL_pos", "RR_pos", "RL_pos"]
-    assert [point.obj_type for point in model_contract.tracked_points] == ["geom"] * 4
-    assert [point.body_name for point in model_contract.tracked_points] == [
+    frame_position_names = [point.name for point in model_contract.frame_position_sensors]
+    assert frame_position_names == ["global_position", "FR_pos", "FL_pos", "RR_pos", "RL_pos"]
+    foot_points = model_contract.frame_position_sensors[1:]
+    assert [point.obj_type for point in foot_points] == ["geom"] * 4
+    assert [point.body_name for point in foot_points] == [
         "FR_calf",
         "FL_calf",
         "RR_calf",
         "RL_calf",
     ]
     np.testing.assert_allclose(
-        np.asarray([point.offset for point in model_contract.tracked_points]),
+        np.asarray([point.offset for point in foot_points]),
         np.tile([-0.002, 0.0, -0.213], (4, 1)),
     )
 
     contacts = {sensor.name: sensor for sensor in model_contract.contact_sensors}
-    assert contacts["FR_foot_contact"].tracked_index == 0
-    assert contacts["FL_foot_contact"].tracked_index == 1
+    assert (
+        model_contract.frame_sensors[contacts["FR_foot_contact"].frame_sensor_index].name
+        == "FR_pos"
+    )
+    assert (
+        model_contract.frame_sensors[contacts["FL_foot_contact"].frame_sensor_index].name
+        == "FL_pos"
+    )
     assert contacts["FL_foot_contact"].data == "found"
     assert contacts["FL_foot_contact"].num == 1
     assert contacts["FL_foot_contact"].dim == 1
     assert contacts["FL_foot_contact"].kind == SENSOR_KIND_CONTACT_FOUND
     assert contacts["FL_foot_contact"].body_name == "FL_calf"
-    assert contacts["base1_contact"].tracked_index is None
+    assert contacts["base1_contact"].frame_sensor_index is None
     assert contacts["base1_contact"].data == "found"
     assert contacts["base1_contact"].body_name == "base"
     assert "base1_contact" in model_contract.sensor_names
     sensor_dims = dict(zip(model_contract.sensor_names, model_contract.sensor_dim, strict=True))
     assert sensor_dims["FL_foot_contact"] == 1
+    assert "global_position" in model_contract.sensor_names
     sensor_kinds = dict(zip(model_contract.sensor_names, model_contract.sensor_type, strict=True))
     assert sensor_kinds["FL_foot_contact"] == SENSOR_KIND_CONTACT_FOUND
 
