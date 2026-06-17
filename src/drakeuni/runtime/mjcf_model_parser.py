@@ -42,6 +42,7 @@ SENSOR_KIND_DOF_POS = 7
 SENSOR_KIND_DOF_VEL = 8
 SENSOR_KIND_TRACKED_FRAME_POS = 9
 SENSOR_KIND_CONTACT_FORCE = 10
+SENSOR_KIND_CONTACT_FOUND = 11
 
 BASE_SENSOR_KIND = {
     "gyro": SENSOR_KIND_GYRO,
@@ -72,7 +73,28 @@ class MjcfContactSensorContract:
     name: str
     geom1: str
     geom2: str
+    data: str
+    num: int
+    reduce: str | None
+    body_name: str | None
+    body_index: int | None
     tracked_index: int | None
+
+    @property
+    def dim(self) -> int:
+        if self.data == "force":
+            return 3
+        if self.data == "found":
+            return 1
+        raise ValueError(f"Unsupported MJCF contact sensor data={self.data!r}")
+
+    @property
+    def kind(self) -> int:
+        if self.data == "force":
+            return SENSOR_KIND_CONTACT_FORCE
+        if self.data == "found":
+            return SENSOR_KIND_CONTACT_FOUND
+        raise ValueError(f"Unsupported MJCF contact sensor data={self.data!r}")
 
 
 @dataclass(frozen=True)
@@ -103,11 +125,14 @@ class DrakeMjcfModelContract:
     def sensor_dim(self) -> np.ndarray:
         dims: list[int] = []
         nu = int(self.ctrl_limits.shape[0])
+        contact_dim = {sensor.name: sensor.dim for sensor in self.contact_sensors}
         for name in self.sensor_names:
             if name in {"base_quat"}:
                 dims.append(4)
             elif name in {"dof_pos", "dof_vel"}:
                 dims.append(nu)
+            elif name in contact_dim:
+                dims.append(contact_dim[name])
             else:
                 dims.append(3)
         return np.asarray(dims, dtype=np.int32)
@@ -126,15 +151,15 @@ class DrakeMjcfModelContract:
     @property
     def sensor_type(self) -> np.ndarray:
         tracked_index = {point.name: i for i, point in enumerate(self.tracked_points)}
-        contact_index = {sensor.name: sensor.tracked_index for sensor in self.contact_sensors}
+        contact_kind = {sensor.name: sensor.kind for sensor in self.contact_sensors}
         kinds: list[int] = []
         for name in self.sensor_names:
             if name in BASE_SENSOR_KIND:
                 kinds.append(BASE_SENSOR_KIND[name])
             elif name in tracked_index:
                 kinds.append(SENSOR_KIND_TRACKED_FRAME_POS)
-            elif name in contact_index:
-                kinds.append(SENSOR_KIND_CONTACT_FORCE)
+            elif name in contact_kind:
+                kinds.append(contact_kind[name])
             else:  # pragma: no cover - guarded by parser construction.
                 raise ValueError(f"Unknown DrakeUni MJCF sensor {name!r}")
         return np.asarray(kinds, dtype=np.int32)
@@ -142,7 +167,7 @@ class DrakeMjcfModelContract:
     @property
     def sensor_index(self) -> np.ndarray:
         tracked_index = {point.name: i for i, point in enumerate(self.tracked_points)}
-        contact_index = {sensor.name: sensor.tracked_index for sensor in self.contact_sensors}
+        contact_index = {sensor.name: sensor.body_index for sensor in self.contact_sensors}
         indices: list[int] = []
         for name in self.sensor_names:
             if name in tracked_index:
@@ -545,6 +570,22 @@ def _extract_sensor_contract_fields(
             geom2 = sensor.attrib.get("geom2", "")
             if not name:
                 continue
+            data = sensor.attrib.get("data", "force").strip().lower()
+            if data not in {"force", "found"}:
+                raise ValueError(
+                    f"DrakeUni supports MJCF contact sensor data='force' or 'found', got {data!r}"
+                )
+            num = int(sensor.attrib.get("num", "1"))
+            if num != 1:
+                raise ValueError(
+                    f"DrakeUni supports MJCF contact sensor num=1, got {num} for {name!r}"
+                )
+            reduce_value = sensor.attrib.get("reduce")
+            body_frame = frames.get(("geom", geom2)) or frames.get(("geom", geom1))
+            body_name = None if body_frame is None else body_frame.body_name
+            body_index = None if body_name is None else body_indices.get(body_name)
+            if body_name is not None and body_index is None:
+                raise ValueError(f"Contact sensor {name!r} refers to unknown body {body_name!r}")
             tracked_index = tracked_object_to_index.get(geom2)
             if tracked_index is None:
                 tracked_index = tracked_object_to_index.get(geom1)
@@ -553,6 +594,11 @@ def _extract_sensor_contract_fields(
                     name=name,
                     geom1=geom1,
                     geom2=geom2,
+                    data=data,
+                    num=num,
+                    reduce=reduce_value,
+                    body_name=body_name,
+                    body_index=body_index,
                     tracked_index=tracked_index,
                 )
             )

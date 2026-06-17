@@ -6,7 +6,9 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
+#include <exception>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -49,6 +51,7 @@ enum SensorKind {
   kDofVel = 8,
   kTrackedFramePosition = 9,
   kContactForce = 10,
+  kContactFound = 11,
 };
 
 using drake::geometry::CollisionFilterDeclaration;
@@ -393,6 +396,11 @@ class DrakeEnvPool {
   }
 
   void LoadState(ThreadWorkspace& runtime, const double* state_row) {
+    for (int i = 0; i < state_dim_; ++i) {
+      if (!std::isfinite(state_row[i])) {
+        throw std::invalid_argument("state contains non-finite values");
+      }
+    }
     runtime.simulator->get_mutable_context().SetTime(state_row[0]);
     plant_->SetPositions(runtime.plant_context, MujocoQposToDrake(state_row + 1, nq_));
     plant_->SetVelocities(runtime.plant_context, MujocoQvelToDrake(state_row + 1 + nq_, nv_));
@@ -489,12 +497,27 @@ class DrakeEnvPool {
           }
           break;
         case kTrackedFramePosition:
+          if (dim(i) != 3) {
+            throw std::invalid_argument("tracked frame position sensor dim must be 3");
+          }
+          if (index(i) < 0 || index(i) >= static_cast<int>(tracked_bodies_.size())) {
+            throw std::invalid_argument("tracked frame position sensor index is out of range");
+          }
+          break;
         case kContactForce:
           if (dim(i) != 3) {
-            throw std::invalid_argument("tracked/contact sensor dim must be 3");
+            throw std::invalid_argument("contact force sensor dim must be 3");
           }
-          if (index(i) >= static_cast<int>(tracked_bodies_.size())) {
-            throw std::invalid_argument("tracked/contact sensor index is out of range");
+          if (index(i) < -1 || index(i) >= plant_->num_bodies()) {
+            throw std::invalid_argument("contact force sensor body index is out of range");
+          }
+          break;
+        case kContactFound:
+          if (dim(i) != 1) {
+            throw std::invalid_argument("contact found sensor dim must be 1");
+          }
+          if (index(i) < -1 || index(i) >= plant_->num_bodies()) {
+            throw std::invalid_argument("contact found sensor body index is out of range");
           }
           break;
         case kGyro:
@@ -528,7 +551,8 @@ class DrakeEnvPool {
     std::vector<Eigen::Vector3d> tracked_positions(
         tracked_bodies_.size(), Eigen::Vector3d::Zero());
     std::vector<Eigen::Vector3d> contact_forces(
-        tracked_bodies_.size(), Eigen::Vector3d::Zero());
+        plant_->num_bodies(), Eigen::Vector3d::Zero());
+    std::vector<int> contact_found(plant_->num_bodies(), 0);
     auto tracked_point_offsets = tracked_point_offsets_.unchecked<2>();
     for (int point = 0; point < static_cast<int>(tracked_bodies_.size()); ++point) {
       const RigidTransform<double> x_wf =
@@ -544,17 +568,15 @@ class DrakeEnvPool {
             *runtime.plant_context);
     for (int i = 0; i < contact_results.num_point_pair_contacts(); ++i) {
       const auto& contact = contact_results.point_pair_contact_info(i);
-      for (int point = 0; point < static_cast<int>(tracked_bodies_.size()); ++point) {
-        const BodyIndex tracked_body = tracked_bodies_[point]->index();
-        Eigen::Vector3d force = Eigen::Vector3d::Zero();
-        if (contact.bodyA_index() == tracked_body) {
-          force = -contact.contact_force();
-        } else if (contact.bodyB_index() == tracked_body) {
-          force = contact.contact_force();
-        } else {
-          continue;
-        }
-        contact_forces[point] += force;
+      const int body_a = static_cast<int>(contact.bodyA_index());
+      const int body_b = static_cast<int>(contact.bodyB_index());
+      if (body_a >= 0 && body_a < static_cast<int>(contact_forces.size())) {
+        contact_found[body_a] = 1;
+        contact_forces[body_a] -= contact.contact_force();
+      }
+      if (body_b >= 0 && body_b < static_cast<int>(contact_forces.size())) {
+        contact_found[body_b] = 1;
+        contact_forces[body_b] += contact.contact_force();
       }
     }
 
@@ -620,6 +642,10 @@ class DrakeEnvPool {
             sensor(env_index, start + axis) =
                 index(item) < 0 ? 0.0 : contact_forces[index(item)][axis];
           }
+          break;
+        case kContactFound:
+          sensor(env_index, start) =
+              index(item) < 0 ? 0.0 : static_cast<double>(contact_found[index(item)]);
           break;
       }
     }
@@ -715,14 +741,26 @@ class DrakeEnvPool {
       return;
     }
     std::vector<std::thread> threads;
+    std::vector<std::exception_ptr> exceptions(thread_count);
     threads.reserve(thread_count);
     for (int thread = 0; thread < thread_count; ++thread) {
       const int begin = thread * nbatch_ / thread_count;
       const int end = (thread + 1) * nbatch_ / thread_count;
-      threads.emplace_back([&, thread, begin, end]() { worker(thread, begin, end); });
+      threads.emplace_back([&, thread, begin, end]() {
+        try {
+          worker(thread, begin, end);
+        } catch (...) {
+          exceptions[thread] = std::current_exception();
+        }
+      });
     }
     for (auto& thread : threads) {
       thread.join();
+    }
+    for (const auto& exception : exceptions) {
+      if (exception != nullptr) {
+        std::rethrow_exception(exception);
+      }
     }
   }
 

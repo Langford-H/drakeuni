@@ -6,6 +6,8 @@ import numpy as np
 import pytest
 
 from drakeuni.runtime.mjcf_model_parser import (
+    SENSOR_KIND_CONTACT_FORCE,
+    SENSOR_KIND_CONTACT_FOUND,
     materialize_drake_compatible_mjcf,
     parse_mjcf_model_contract,
     read_keyframe_qpos,
@@ -51,6 +53,12 @@ def test_go1_drake_scene_mjcf_model_parser_discovers_contract() -> None:
         "RL_foot_contact",
         "RR_foot_contact",
     ]
+    contacts = {sensor.name: sensor for sensor in model_contract.contact_sensors}
+    assert contacts["FL_foot_contact"].data == "force"
+    assert contacts["FL_foot_contact"].dim == 3
+    assert contacts["FL_foot_contact"].kind == SENSOR_KIND_CONTACT_FORCE
+    sensor_dims = dict(zip(model_contract.sensor_names, model_contract.sensor_dim, strict=True))
+    assert sensor_dims["FL_foot_contact"] == 3
     assert "global_position" not in model_contract.sensor_names
 
 
@@ -82,8 +90,19 @@ def test_go2_scene_mjcf_model_parser_uses_geom_frames_and_joint_range_ctrl_fallb
     contacts = {sensor.name: sensor for sensor in model_contract.contact_sensors}
     assert contacts["FR_foot_contact"].tracked_index == 0
     assert contacts["FL_foot_contact"].tracked_index == 1
+    assert contacts["FL_foot_contact"].data == "found"
+    assert contacts["FL_foot_contact"].num == 1
+    assert contacts["FL_foot_contact"].dim == 1
+    assert contacts["FL_foot_contact"].kind == SENSOR_KIND_CONTACT_FOUND
+    assert contacts["FL_foot_contact"].body_name == "FL_calf"
     assert contacts["base1_contact"].tracked_index is None
+    assert contacts["base1_contact"].data == "found"
+    assert contacts["base1_contact"].body_name == "base"
     assert "base1_contact" in model_contract.sensor_names
+    sensor_dims = dict(zip(model_contract.sensor_names, model_contract.sensor_dim, strict=True))
+    assert sensor_dims["FL_foot_contact"] == 1
+    sensor_kinds = dict(zip(model_contract.sensor_names, model_contract.sensor_type, strict=True))
+    assert sensor_kinds["FL_foot_contact"] == SENSOR_KIND_CONTACT_FOUND
 
 
 def test_go2_drake_compatible_mjcf_expands_physics_defaults() -> None:

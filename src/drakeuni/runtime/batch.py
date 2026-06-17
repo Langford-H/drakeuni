@@ -181,15 +181,6 @@ class DrakeBatchRuntime:
         output = self._pool.compute_body_state(self._physics_state, ids)
         return {name: np.asarray(value, dtype=np.float64).copy() for name, value in output.items()}
 
-    def sensor(self, name: str) -> np.ndarray:
-        try:
-            index = self._model_info.sensor_names.index(name)
-        except ValueError as exc:
-            raise KeyError(f"Unknown DrakeUni sensor: {name}") from exc
-        adr = int(self._model_info.sensor_adr[index])
-        dim = int(self._model_info.sensor_dim[index])
-        return self._sensor_data[:, adr : adr + dim].copy()
-
     def body_ids(self, names: list[str] | tuple[str, ...]) -> np.ndarray:
         return np.asarray(
             [self._model_contract.body_index(str(name)) for name in names],
