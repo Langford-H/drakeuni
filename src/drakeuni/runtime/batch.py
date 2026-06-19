@@ -10,6 +10,7 @@ import numpy as np
 from drakeuni.batch_env import DrakeEnvPool, batch_available, batch_import_error
 
 from .mjcf_model_parser import (
+    ROOT_QPOS_DIM,
     ROOT_QVEL_DIM,
     DrakeCompatibleMjcf,
     materialize_drake_compatible_mjcf,
@@ -39,10 +40,6 @@ class DrakeBatchRuntime:
         self._drake_model: DrakeCompatibleMjcf = materialize_drake_compatible_mjcf(
             self._model_file
         )
-        home_qpos = read_keyframe_qpos(self._model_file, "home")
-        if home_qpos is None:
-            raise ValueError(f"DrakeBatchRuntime requires keyframe 'home' in {self._model_file}")
-        self._home_qpos = np.asarray(home_qpos, dtype=np.float64).copy()
         self._nthread = _resolve_nthread(self._num_envs, int(config.nthread))
         sensor_frame_body_indices, sensor_frame_offsets = sensor_frames_as_pool_inputs(
             self._model_contract
@@ -53,8 +50,12 @@ class DrakeBatchRuntime:
             self._sim_dt,
             self._model_contract.ctrl_limits,
             self._model_contract.torque_limits,
+            self._model_contract.actuator_kind,
+            self._model_contract.actuator_gear,
             self._model_contract.actuator_stiffness,
             self._model_contract.actuator_damping,
+            self._model_contract.actuator_gainprm,
+            self._model_contract.actuator_biasprm,
             sensor_frame_body_indices,
             sensor_frame_offsets,
             self._model_contract.sensor_type,
@@ -65,12 +66,32 @@ class DrakeBatchRuntime:
             self._nthread,
         )
 
-        nv = int(self._pool.state_dim) - 1 - int(self._home_qpos.size)
+        nq = int(self._pool.num_positions)
+        nv = int(self._pool.num_velocities)
+        if nq <= ROOT_QPOS_DIM:
+            raise RuntimeError(f"DrakeEnvPool batch runtime returned invalid nq={nq}")
         if nv <= ROOT_QVEL_DIM:
             raise RuntimeError(f"DrakeEnvPool batch runtime returned invalid nv={nv}")
-        self._home_qvel = np.zeros(nv, dtype=np.float64)
+        home_qpos = read_keyframe_qpos(self._model_file, "home")
+        if home_qpos is None:
+            default_state = np.asarray(self._pool.default_state(), dtype=np.float64).reshape(-1)
+            if default_state.shape != (int(self._pool.state_dim),):
+                raise RuntimeError(
+                    "DrakeEnvPool default_state must have shape "
+                    f"({int(self._pool.state_dim)},), got {default_state.shape}"
+                )
+            self._home_qpos = default_state[1 : 1 + nq].copy()
+            self._home_qvel = default_state[1 + nq : 1 + nq + nv].copy()
+        else:
+            self._home_qpos = np.asarray(home_qpos, dtype=np.float64).copy()
+            if self._home_qpos.shape != (nq,):
+                raise ValueError(
+                    f"DrakeBatchRuntime keyframe 'home' qpos must have shape ({nq},), "
+                    f"got {self._home_qpos.shape}"
+                )
+            self._home_qvel = np.zeros(nv, dtype=np.float64)
         self._model_info = DrakeModelInfo(
-            nq=int(self._home_qpos.size),
+            nq=nq,
             nv=nv,
             nu=int(self._pool.control_dim),
             home_qpos=self._home_qpos.copy(),

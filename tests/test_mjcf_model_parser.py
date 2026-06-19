@@ -6,6 +6,11 @@ import numpy as np
 import pytest
 
 from drakeuni.runtime.mjcf_model_parser import (
+    ACTUATOR_KIND_DAMPER,
+    ACTUATOR_KIND_GENERAL,
+    ACTUATOR_KIND_MOTOR,
+    ACTUATOR_KIND_POSITION,
+    ACTUATOR_KIND_VELOCITY,
     SENSOR_KIND_CONTACT_FORCE,
     SENSOR_KIND_CONTACT_FOUND,
     materialize_drake_compatible_mjcf,
@@ -21,6 +26,27 @@ def _asset(path: str) -> Path:
     if not asset_path.exists():
         pytest.skip(f"UniLab asset not available: {asset_path}")
     return asset_path
+
+
+def _write_actuator_scene(tmp_path: Path, actuator_xml: str) -> Path:
+    scene = tmp_path / "actuator_scene.xml"
+    scene.write_text(
+        f"""
+<mujoco model="actuator_scene">
+  <worldbody>
+    <body name="body" pos="0 0 0">
+      <joint name="hinge" type="hinge" range="-1 1"/>
+      <geom name="geom" type="sphere" size="0.05" mass="1"/>
+      <site name="site" pos="0 0 0"/>
+    </body>
+  </worldbody>
+  <actuator>
+    {actuator_xml}
+  </actuator>
+</mujoco>
+""".strip()
+    )
+    return scene
 
 
 def test_go1_drake_scene_mjcf_model_parser_discovers_contract() -> None:
@@ -155,3 +181,64 @@ def test_go2_drake_compatible_mjcf_expands_physics_defaults() -> None:
         assert foot.attrib["conaffinity"] == "2"
     finally:
         materialized.close()
+
+
+@pytest.mark.parametrize(
+    ("actuator_xml", "expected_kind"),
+    [
+        (
+            '<position name="pos" joint="hinge" forcerange="-5 5" kp="10" kv="1"/>',
+            ACTUATOR_KIND_POSITION,
+        ),
+        (
+            '<velocity name="vel" joint="hinge" ctrlrange="-2 2" forcerange="-5 5" kv="3"/>',
+            ACTUATOR_KIND_VELOCITY,
+        ),
+        (
+            '<motor name="motor" joint="hinge" ctrlrange="-2 2" forcerange="-4 4"/>',
+            ACTUATOR_KIND_MOTOR,
+        ),
+        (
+            '<damper name="damper" joint="hinge" ctrlrange="0 1" forcerange="-4 4" kv="2"/>',
+            ACTUATOR_KIND_DAMPER,
+        ),
+        (
+            '<general name="gen" joint="hinge" ctrlrange="-1 1" forcerange="-5 5" '
+            'gainprm="2 0.5 0.25" biasprm="1 -2 -3"/>',
+            ACTUATOR_KIND_GENERAL,
+        ),
+    ],
+)
+def test_mjcf_actuator_parser_records_supported_joint_actuator_kinds(
+    tmp_path: Path,
+    actuator_xml: str,
+    expected_kind: int,
+) -> None:
+    model_contract = parse_mjcf_model_contract(_write_actuator_scene(tmp_path, actuator_xml))
+
+    assert model_contract.actuator_kind.tolist() == [expected_kind]
+    assert model_contract.ctrl_limits.shape == (1, 2)
+    assert model_contract.torque_limits.shape == (1,)
+    assert model_contract.actuator_gear.shape == (1,)
+    assert model_contract.actuator_gainprm.shape == (1, 3)
+    assert model_contract.actuator_biasprm.shape == (1, 3)
+
+
+@pytest.mark.parametrize(
+    "actuator_xml",
+    [
+        '<intvelocity name="bad" joint="hinge" ctrlrange="-1 1"/>',
+        '<cylinder name="bad" joint="hinge" ctrlrange="-1 1"/>',
+        '<muscle name="bad" joint="hinge" ctrlrange="-1 1"/>',
+        '<adhesion name="bad" body="body" ctrlrange="-1 1"/>',
+        '<dcmotor name="bad" joint="hinge" ctrlrange="-1 1"/>',
+        '<plugin name="bad" joint="hinge" ctrlrange="-1 1"/>',
+        '<motor name="bad" site="site" ctrlrange="-1 1"/>',
+    ],
+)
+def test_mjcf_actuator_parser_rejects_unsupported_actuator_semantics(
+    tmp_path: Path,
+    actuator_xml: str,
+) -> None:
+    with pytest.raises(ValueError, match="DrakeUni actuator"):
+        parse_mjcf_model_contract(_write_actuator_scene(tmp_path, actuator_xml))

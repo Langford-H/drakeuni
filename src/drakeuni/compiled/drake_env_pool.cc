@@ -49,6 +49,18 @@ enum SensorKind {
   kFrameZAxis = 6,
   kContactForce = 7,
   kContactFound = 8,
+  kJointPosition = 9,
+  kJointVelocity = 10,
+  kJointActuatorForce = 11,
+  kFrameQuat = 12,
+};
+
+enum ActuatorKind {
+  kPositionActuator = 0,
+  kVelocityActuator = 1,
+  kMotorActuator = 2,
+  kDamperActuator = 3,
+  kGeneralActuator = 4,
 };
 
 using drake::geometry::CollisionFilterDeclaration;
@@ -76,7 +88,7 @@ py::array_t<double> MakeArray(const std::vector<py::ssize_t>& shape) {
   return py::array_t<double>(shape);
 }
 
-Eigen::VectorXd MujocoQposToDrake(const double* qpos, int nq) {
+Eigen::VectorXd CompactQposToDrake(const double* qpos, int nq) {
   Eigen::VectorXd out(nq);
   out.segment(0, 4) = Eigen::Map<const Eigen::Vector4d>(qpos + 3);
   out.segment(4, 3) = Eigen::Map<const Eigen::Vector3d>(qpos);
@@ -87,7 +99,7 @@ Eigen::VectorXd MujocoQposToDrake(const double* qpos, int nq) {
   return out;
 }
 
-Eigen::VectorXd MujocoQvelToDrake(const double* qvel, int nv) {
+Eigen::VectorXd CompactQvelToDrake(const double* qvel, int nv) {
   Eigen::VectorXd out(nv);
   out.segment(0, 3) = Eigen::Map<const Eigen::Vector3d>(qvel + 3);
   out.segment(3, 3) = Eigen::Map<const Eigen::Vector3d>(qvel);
@@ -98,7 +110,7 @@ Eigen::VectorXd MujocoQvelToDrake(const double* qvel, int nv) {
   return out;
 }
 
-void DrakeQposToMujoco(const Eigen::VectorXd& qpos, double* out) {
+void DrakeQposToCompact(const Eigen::VectorXd& qpos, double* out) {
   Eigen::Map<Eigen::Vector3d> pos(out);
   Eigen::Map<Eigen::Vector4d> quat(out + 3);
   pos = qpos.segment(4, 3);
@@ -109,7 +121,7 @@ void DrakeQposToMujoco(const Eigen::VectorXd& qpos, double* out) {
   }
 }
 
-void DrakeQvelToMujoco(const Eigen::VectorXd& qvel, double* out) {
+void DrakeQvelToCompact(const Eigen::VectorXd& qvel, double* out) {
   Eigen::Map<Eigen::Vector3d> linear(out);
   Eigen::Map<Eigen::Vector3d> angular(out + 3);
   linear = qvel.segment(3, 3);
@@ -135,29 +147,37 @@ void RequireShape(const py::buffer_info& info, const std::vector<py::ssize_t>& s
 struct ThreadWorkspace {
   Context<double>* plant_context{};
   std::unique_ptr<Simulator<double>> simulator;
+  std::vector<double> last_actuator_effort;
 };
 
 class DrakeEnvPool {
  public:
   DrakeEnvPool(const std::string& model_file, int nbatch, double sim_dt,
-                     py::array_t<double, py::array::c_style | py::array::forcecast> ctrl_limits,
-                     py::array_t<double, py::array::c_style | py::array::forcecast> torque_limits,
-                     py::array_t<double, py::array::c_style | py::array::forcecast> actuator_stiffness,
-                     py::array_t<double, py::array::c_style | py::array::forcecast> actuator_damping,
-                     const std::vector<int>& sensor_frame_body_indices,
-                     py::array_t<double, py::array::c_style | py::array::forcecast> sensor_frame_offsets,
-                     py::array_t<int, py::array::c_style | py::array::forcecast> sensor_type,
-                     py::array_t<int, py::array::c_style | py::array::forcecast> sensor_index,
-                     py::array_t<int, py::array::c_style | py::array::forcecast> sensor_adr,
-                     py::array_t<int, py::array::c_style | py::array::forcecast> sensor_dim,
-                     int nsensordata,
-                     int nthread)
+               py::array_t<double, py::array::c_style | py::array::forcecast> ctrl_limits,
+               py::array_t<double, py::array::c_style | py::array::forcecast> torque_limits,
+               py::array_t<int, py::array::c_style | py::array::forcecast> actuator_kind,
+               py::array_t<double, py::array::c_style | py::array::forcecast> actuator_gear,
+               py::array_t<double, py::array::c_style | py::array::forcecast> actuator_stiffness,
+               py::array_t<double, py::array::c_style | py::array::forcecast> actuator_damping,
+               py::array_t<double, py::array::c_style | py::array::forcecast> actuator_gainprm,
+               py::array_t<double, py::array::c_style | py::array::forcecast> actuator_biasprm,
+               const std::vector<int>& sensor_frame_body_indices,
+               py::array_t<double, py::array::c_style | py::array::forcecast> sensor_frame_offsets,
+               py::array_t<int, py::array::c_style | py::array::forcecast> sensor_type,
+               py::array_t<int, py::array::c_style | py::array::forcecast> sensor_index,
+               py::array_t<int, py::array::c_style | py::array::forcecast> sensor_adr,
+               py::array_t<int, py::array::c_style | py::array::forcecast> sensor_dim,
+               int nsensordata, int nthread)
       : nbatch_(nbatch),
         sim_dt_(sim_dt),
         ctrl_limits_(std::move(ctrl_limits)),
         torque_limits_(std::move(torque_limits)),
+        actuator_kind_(std::move(actuator_kind)),
+        actuator_gear_(std::move(actuator_gear)),
         actuator_stiffness_(std::move(actuator_stiffness)),
         actuator_damping_(std::move(actuator_damping)),
+        actuator_gainprm_(std::move(actuator_gainprm)),
+        actuator_biasprm_(std::move(actuator_biasprm)),
         sensor_frame_body_indices_(sensor_frame_body_indices),
         sensor_frame_offsets_(std::move(sensor_frame_offsets)),
         sensor_type_(std::move(sensor_type)),
@@ -175,8 +195,12 @@ class DrakeEnvPool {
     }
     nu_ = static_cast<int>(ctrl_info.shape[0]);
     RequireShape(torque_limits_.request(), {nu_}, "torque_limits");
+    RequireShape(actuator_kind_.request(), {nu_}, "actuator_kind");
+    RequireShape(actuator_gear_.request(), {nu_}, "actuator_gear");
     RequireShape(actuator_stiffness_.request(), {nu_}, "actuator_stiffness");
     RequireShape(actuator_damping_.request(), {nu_}, "actuator_damping");
+    RequireShape(actuator_gainprm_.request(), {nu_, 3}, "actuator_gainprm");
+    RequireShape(actuator_biasprm_.request(), {nu_, 3}, "actuator_biasprm");
     RequireShape(sensor_frame_offsets_.request(),
                  {static_cast<py::ssize_t>(sensor_frame_body_indices_.size()), 3},
                  "sensor_frame_offsets");
@@ -208,18 +232,33 @@ class DrakeEnvPool {
     model_instance_ = model_instances.at(0);
 
     auto torque = torque_limits_.unchecked<1>();
+    auto kind = actuator_kind_.unchecked<1>();
     auto stiffness = actuator_stiffness_.unchecked<1>();
     auto damping = actuator_damping_.unchecked<1>();
     for (int i = 0; i < nu_; ++i) {
       auto& actuator = plant_->get_mutable_joint_actuator(JointActuatorIndex(i));
       actuator.set_effort_limit(torque(i));
-      actuator.set_controller_gains(PdControllerGains(stiffness(i), damping(i)));
+      switch (kind(i)) {
+        case kPositionActuator:
+          actuator.set_controller_gains(PdControllerGains(stiffness(i), damping(i)));
+          break;
+        case kVelocityActuator:
+          actuator.set_controller_gains(PdControllerGains(0.0, damping(i)));
+          break;
+        case kMotorActuator:
+        case kDamperActuator:
+        case kGeneralActuator:
+          break;
+        default:
+          throw std::invalid_argument("unknown DrakeUni actuator kind");
+      }
     }
 
     // Drake's MJCF parser does not honor MuJoCo contype/conaffinity here, so
     // exclude robot self-collisions before Finalize().
     num_filtered_geometries_ = ExcludeRobotSelfCollisions();
     plant_->Finalize();
+    CacheActuatorJointIndices();
     for (int frame_body_index : sensor_frame_body_indices_) {
       sensor_frame_bodies_.push_back(&plant_->get_body(BodyIndex(frame_body_index)));
     }
@@ -241,12 +280,26 @@ class DrakeEnvPool {
 
   int nbatch() const { return nbatch_; }
   int state_dim() const { return state_dim_; }
+  int num_positions() const { return nq_; }
+  int num_velocities() const { return nv_; }
   int control_dim() const { return nu_; }
   int num_bodies() const { return plant_->num_bodies(); }
   int nsensordata() const { return nsensordata_; }
   int nthread() const { return nthread_; }
   int workspace_count() const { return static_cast<int>(workspaces_.size()); }
   int num_filtered_geometries() const { return num_filtered_geometries_; }
+
+  py::array_t<double> default_state() const {
+    auto state_out = MakeArray({state_dim_});
+    auto state = state_out.mutable_unchecked<1>();
+    const auto& runtime = workspaces_.at(0);
+    state(0) = runtime.simulator->get_context().get_time();
+    const Eigen::VectorXd q = plant_->GetPositions(*runtime.plant_context);
+    const Eigen::VectorXd v = plant_->GetVelocities(*runtime.plant_context);
+    DrakeQposToCompact(q, &state(1));
+    DrakeQvelToCompact(v, &state(1 + nq_));
+    return state_out;
+  }
 
   py::dict step(py::array_t<double, py::array::c_style | py::array::forcecast> state0,
                 int nstep,
@@ -385,9 +438,10 @@ class DrakeEnvPool {
     ThreadWorkspace runtime;
     auto context = diagram_->CreateDefaultContext();
     runtime.plant_context = &plant_->GetMyMutableContextFromRoot(context.get());
+    runtime.last_actuator_effort.assign(nu_, 0.0);
     plant_->get_actuation_input_port(model_instance_)
         .FixValue(runtime.plant_context, Eigen::VectorXd::Zero(nu_));
-    SetPdTarget(Eigen::VectorXd::Zero(nu_), runtime.plant_context);
+    SetNeutralActuatorInputs(runtime.plant_context);
     runtime.simulator = std::make_unique<Simulator<double>>(*diagram_, std::move(context));
     runtime.plant_context =
         &plant_->GetMyMutableContextFromRoot(&runtime.simulator->get_mutable_context());
@@ -403,11 +457,11 @@ class DrakeEnvPool {
       }
     }
     runtime.simulator->get_mutable_context().SetTime(state_row[0]);
-    plant_->SetPositions(runtime.plant_context, MujocoQposToDrake(state_row + 1, nq_));
-    plant_->SetVelocities(runtime.plant_context, MujocoQvelToDrake(state_row + 1 + nq_, nv_));
+    plant_->SetPositions(runtime.plant_context, CompactQposToDrake(state_row + 1, nq_));
+    plant_->SetVelocities(runtime.plant_context, CompactQvelToDrake(state_row + 1 + nq_, nv_));
     if (nu_ > 0) {
-      Eigen::VectorXd target = Eigen::Map<const Eigen::VectorXd>(state_row + 1 + kRootQposDim, nu_);
-      SetPdTarget(target, runtime.plant_context);
+      SetNeutralActuatorInputs(runtime.plant_context);
+      std::fill(runtime.last_actuator_effort.begin(), runtime.last_actuator_effort.end(), 0.0);
     }
     runtime.simulator->Initialize();
   }
@@ -435,7 +489,7 @@ class DrakeEnvPool {
                                  ctrl_limits(j, 1));
         }
       }
-      SetPdTarget(target, runtime.plant_context);
+      ApplyActuatorControl(target, runtime);
       if (body_forces != nullptr) {
         SetExternalBodyForces(runtime, env_index, body_forces);
       } else {
@@ -445,11 +499,106 @@ class DrakeEnvPool {
     }
   }
 
-  void SetPdTarget(const Eigen::VectorXd& target_q, Context<double>* plant_context) {
-    Eigen::VectorXd desired(2 * nu_);
-    desired.head(nu_) = target_q;
-    desired.tail(nu_).setZero();
+  void CacheActuatorJointIndices() {
+    actuator_position_start_.clear();
+    actuator_velocity_start_.clear();
+    actuator_position_start_.reserve(nu_);
+    actuator_velocity_start_.reserve(nu_);
+    for (int i = 0; i < nu_; ++i) {
+      const auto& actuator = plant_->get_joint_actuator(JointActuatorIndex(i));
+      if (actuator.num_inputs() != 1 || actuator.joint().num_positions() != 1 ||
+          actuator.joint().num_velocities() != 1) {
+        throw std::invalid_argument(
+            "DrakeUni actuator support is limited to single-dof joint actuators");
+      }
+      actuator_position_start_.push_back(actuator.joint().position_start());
+      actuator_velocity_start_.push_back(actuator.joint().velocity_start());
+    }
+  }
+
+  void SetNeutralActuatorInputs(Context<double>* plant_context) {
+    Eigen::VectorXd direct = Eigen::VectorXd::Zero(nu_);
+    Eigen::VectorXd desired = Eigen::VectorXd::Zero(2 * nu_);
+    const Eigen::VectorXd q = plant_->GetPositions(*plant_context);
+    const Eigen::VectorXd v = plant_->GetVelocities(*plant_context);
+    auto kind = actuator_kind_.unchecked<1>();
+    for (int i = 0; i < nu_; ++i) {
+      if (kind(i) == kPositionActuator) {
+        desired[i] = q[actuator_position_start_.at(i)];
+      } else if (kind(i) == kVelocityActuator) {
+        desired[nu_ + i] = v[actuator_velocity_start_.at(i)];
+      }
+    }
+    plant_->get_actuation_input_port(model_instance_).FixValue(plant_context, direct);
     plant_->get_desired_state_input_port(model_instance_).FixValue(plant_context, desired);
+  }
+
+  void ApplyActuatorControl(const Eigen::VectorXd& control, ThreadWorkspace& runtime) {
+    Context<double>* plant_context = runtime.plant_context;
+    Eigen::VectorXd direct = Eigen::VectorXd::Zero(nu_);
+    Eigen::VectorXd desired = Eigen::VectorXd::Zero(2 * nu_);
+    const Eigen::VectorXd q = plant_->GetPositions(*plant_context);
+    const Eigen::VectorXd v = plant_->GetVelocities(*plant_context);
+    auto kind = actuator_kind_.unchecked<1>();
+    auto gear = actuator_gear_.unchecked<1>();
+    auto stiffness = actuator_stiffness_.unchecked<1>();
+    auto damping = actuator_damping_.unchecked<1>();
+    auto gainprm = actuator_gainprm_.unchecked<2>();
+    auto biasprm = actuator_biasprm_.unchecked<2>();
+    runtime.last_actuator_effort.assign(nu_, 0.0);
+    for (int i = 0; i < nu_; ++i) {
+      const double u = control[i];
+      const int q_index = actuator_position_start_.at(i);
+      const int v_index = actuator_velocity_start_.at(i);
+      const double g = gear(i);
+      switch (kind(i)) {
+        case kPositionActuator:
+          desired[i] = u;
+          desired[nu_ + i] = 0.0;
+          runtime.last_actuator_effort[i] =
+              LimitEffort(i, stiffness(i) * (u - q[q_index]) - damping(i) * v[v_index]);
+          break;
+        case kVelocityActuator:
+          desired[i] = q[q_index];
+          desired[nu_ + i] = u;
+          runtime.last_actuator_effort[i] = LimitEffort(i, damping(i) * (u - v[v_index]));
+          break;
+        case kMotorActuator:
+          direct[i] = LimitEffort(i, g * u);
+          runtime.last_actuator_effort[i] = direct[i];
+          break;
+        case kDamperActuator: {
+          const double length_rate = g * v[v_index];
+          direct[i] = LimitEffort(i, g * (-damping(i) * length_rate * u));
+          runtime.last_actuator_effort[i] = direct[i];
+          break;
+        }
+        case kGeneralActuator: {
+          const double length = g * q[q_index];
+          const double length_rate = g * v[v_index];
+          const double gain = gainprm(i, 0) + gainprm(i, 1) * length +
+                              gainprm(i, 2) * length_rate;
+          const double bias = biasprm(i, 0) + biasprm(i, 1) * length +
+                              biasprm(i, 2) * length_rate;
+          direct[i] = LimitEffort(i, g * (gain * u + bias));
+          runtime.last_actuator_effort[i] = direct[i];
+          break;
+        }
+        default:
+          throw std::invalid_argument("unknown DrakeUni actuator kind");
+      }
+    }
+    plant_->get_actuation_input_port(model_instance_).FixValue(plant_context, direct);
+    plant_->get_desired_state_input_port(model_instance_).FixValue(plant_context, desired);
+  }
+
+  double LimitEffort(int actuator_index, double effort) const {
+    auto torque = torque_limits_.unchecked<1>();
+    const double limit = torque(actuator_index);
+    if (!std::isfinite(limit)) {
+      return effort;
+    }
+    return std::clamp(effort, -limit, limit);
   }
 
   void SetExternalBodyForces(
@@ -480,8 +629,8 @@ class DrakeEnvPool {
     state(env_index, 0) = runtime.simulator->get_context().get_time();
     Eigen::VectorXd q = plant_->GetPositions(*runtime.plant_context);
     Eigen::VectorXd v = plant_->GetVelocities(*runtime.plant_context);
-    DrakeQposToMujoco(q, &state(env_index, 1));
-    DrakeQvelToMujoco(v, &state(env_index, 1 + nq_));
+    DrakeQposToCompact(q, &state(env_index, 1));
+    DrakeQvelToCompact(v, &state(env_index, 1 + nq_));
     SaveCompactState(env_index, &state(env_index, 0));
   }
 
@@ -509,6 +658,14 @@ class DrakeEnvPool {
             throw std::invalid_argument("frame sensor index is out of range");
           }
           break;
+        case kFrameQuat:
+          if (dim(i) != 4) {
+            throw std::invalid_argument("frame quaternion sensor dim must be 4");
+          }
+          if (index(i) < 0 || index(i) >= static_cast<int>(sensor_frame_bodies_.size())) {
+            throw std::invalid_argument("frame quaternion sensor index is out of range");
+          }
+          break;
         case kContactForce:
           if (dim(i) != 3) {
             throw std::invalid_argument("contact force sensor dim must be 3");
@@ -523,6 +680,16 @@ class DrakeEnvPool {
           }
           if (index(i) < -1 || index(i) >= plant_->num_bodies()) {
             throw std::invalid_argument("contact found sensor body index is out of range");
+          }
+          break;
+        case kJointPosition:
+        case kJointVelocity:
+        case kJointActuatorForce:
+          if (dim(i) != 1) {
+            throw std::invalid_argument("joint sensor dim must be 1");
+          }
+          if (index(i) < 0 || index(i) >= nu_) {
+            throw std::invalid_argument("joint sensor actuator index is out of range");
           }
           break;
         default:
@@ -547,9 +714,13 @@ class DrakeEnvPool {
         sensor_frame_bodies_.size(), Eigen::Vector3d::Zero());
     std::vector<Eigen::Vector3d> frame_zaxis_w(
         sensor_frame_bodies_.size(), Eigen::Vector3d::Zero());
+    std::vector<Eigen::Vector4d> frame_quat_w(
+        sensor_frame_bodies_.size(), Eigen::Vector4d::Zero());
     std::vector<Eigen::Vector3d> contact_forces(
         plant_->num_bodies(), Eigen::Vector3d::Zero());
     std::vector<int> contact_found(plant_->num_bodies(), 0);
+    const Eigen::VectorXd q = plant_->GetPositions(*runtime.plant_context);
+    const Eigen::VectorXd v = plant_->GetVelocities(*runtime.plant_context);
     auto sensor_frame_offsets = sensor_frame_offsets_.unchecked<2>();
     for (int frame = 0; frame < static_cast<int>(sensor_frame_bodies_.size()); ++frame) {
       const RigidTransform<double> x_wb =
@@ -560,6 +731,7 @@ class DrakeEnvPool {
       const auto acceleration_w =
           sensor_frame_bodies_[frame]->EvalSpatialAccelerationInWorld(*runtime.plant_context);
       const Eigen::Matrix3d r_wb = x_wb.rotation().matrix();
+      const Eigen::Quaterniond quat_wb = x_wb.rotation().ToQuaternion();
       const Eigen::Matrix3d r_bw = r_wb.transpose();
       const Eigen::Vector3d offset(sensor_frame_offsets(frame, 0),
                                    sensor_frame_offsets(frame, 1),
@@ -574,6 +746,8 @@ class DrakeEnvPool {
           r_bw * (acceleration_w.translational() + acceleration_w.rotational().cross(offset_w) +
                   velocity_w.rotational().cross(velocity_w.rotational().cross(offset_w)));
       frame_zaxis_w[frame] = r_wb.col(2);
+      frame_quat_w[frame] =
+          Eigen::Vector4d(quat_wb.w(), quat_wb.x(), quat_wb.y(), quat_wb.z());
     }
 
     const auto& contact_results =
@@ -637,6 +811,11 @@ class DrakeEnvPool {
             sensor(env_index, start + axis) = frame_zaxis_w[frame][axis];
           }
           break;
+        case kFrameQuat:
+          for (int axis = 0; axis < 4; ++axis) {
+            sensor(env_index, start + axis) = frame_quat_w[frame][axis];
+          }
+          break;
         case kContactForce:
           for (int axis = 0; axis < 3; ++axis) {
             sensor(env_index, start + axis) =
@@ -646,6 +825,15 @@ class DrakeEnvPool {
         case kContactFound:
           sensor(env_index, start) =
               index(item) < 0 ? 0.0 : static_cast<double>(contact_found[index(item)]);
+          break;
+        case kJointPosition:
+          sensor(env_index, start) = q[actuator_position_start_.at(index(item))];
+          break;
+        case kJointVelocity:
+          sensor(env_index, start) = v[actuator_velocity_start_.at(index(item))];
+          break;
+        case kJointActuatorForce:
+          sensor(env_index, start) = runtime.last_actuator_effort.at(index(item));
           break;
       }
     }
@@ -772,8 +960,12 @@ class DrakeEnvPool {
   int state_dim_{};
   py::array_t<double> ctrl_limits_;
   py::array_t<double> torque_limits_;
+  py::array_t<int> actuator_kind_;
+  py::array_t<double> actuator_gear_;
   py::array_t<double> actuator_stiffness_;
   py::array_t<double> actuator_damping_;
+  py::array_t<double> actuator_gainprm_;
+  py::array_t<double> actuator_biasprm_;
   std::vector<int> sensor_frame_body_indices_;
   py::array_t<double> sensor_frame_offsets_;
   py::array_t<int> sensor_type_;
@@ -789,6 +981,8 @@ class DrakeEnvPool {
   SceneGraph<double>* scene_graph_{};
   ModelInstanceIndex model_instance_;
   std::vector<const RigidBody<double>*> sensor_frame_bodies_;
+  std::vector<int> actuator_position_start_;
+  std::vector<int> actuator_velocity_start_;
   std::vector<double> compact_state_;
   std::vector<ThreadWorkspace> workspaces_;
 };
@@ -804,6 +998,10 @@ PYBIND11_MODULE(_drake_env_pool, m) {
       .def(py::init<const std::string&, int, double,
                     py::array_t<double, py::array::c_style | py::array::forcecast>,
                     py::array_t<double, py::array::c_style | py::array::forcecast>,
+                    py::array_t<int, py::array::c_style | py::array::forcecast>,
+                    py::array_t<double, py::array::c_style | py::array::forcecast>,
+                    py::array_t<double, py::array::c_style | py::array::forcecast>,
+                    py::array_t<double, py::array::c_style | py::array::forcecast>,
                     py::array_t<double, py::array::c_style | py::array::forcecast>,
                     py::array_t<double, py::array::c_style | py::array::forcecast>,
                     const std::vector<int>&,
@@ -813,14 +1011,19 @@ PYBIND11_MODULE(_drake_env_pool, m) {
                     py::array_t<int, py::array::c_style | py::array::forcecast>,
                     py::array_t<int, py::array::c_style | py::array::forcecast>, int, int>(),
            py::arg("model_file"), py::arg("nbatch"), py::arg("sim_dt"),
-           py::arg("ctrl_limits"), py::arg("torque_limits"), py::arg("actuator_stiffness"),
-           py::arg("actuator_damping"), py::arg("sensor_frame_body_indices"),
+           py::arg("ctrl_limits"), py::arg("torque_limits"),
+           py::arg("actuator_kind"), py::arg("actuator_gear"),
+           py::arg("actuator_stiffness"), py::arg("actuator_damping"),
+           py::arg("actuator_gainprm"), py::arg("actuator_biasprm"),
+           py::arg("sensor_frame_body_indices"),
            py::arg("sensor_frame_offsets"),
            py::arg("sensor_type"), py::arg("sensor_index"), py::arg("sensor_adr"),
            py::arg("sensor_dim"), py::arg("nsensordata"),
            py::arg("nthread") = 1)
       .def_property_readonly("nbatch", &DrakeEnvPool::nbatch)
       .def_property_readonly("state_dim", &DrakeEnvPool::state_dim)
+      .def_property_readonly("num_positions", &DrakeEnvPool::num_positions)
+      .def_property_readonly("num_velocities", &DrakeEnvPool::num_velocities)
       .def_property_readonly("control_dim", &DrakeEnvPool::control_dim)
       .def_property_readonly("num_bodies", &DrakeEnvPool::num_bodies)
       .def_property_readonly("nsensordata", &DrakeEnvPool::nsensordata)
@@ -835,5 +1038,6 @@ PYBIND11_MODULE(_drake_env_pool, m) {
            py::arg("body_indices"))
       .def("reset", &DrakeEnvPool::reset, py::arg("env_ids"), py::arg("initial_state"),
            py::arg("return_sensor") = false)
+      .def("default_state", &DrakeEnvPool::default_state)
       .def("snapshot", &DrakeEnvPool::snapshot, py::arg("return_sensor") = false);
 }
