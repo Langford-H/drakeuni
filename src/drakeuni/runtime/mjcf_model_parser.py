@@ -826,6 +826,8 @@ def _collect_default_classes(
     def walk_default(
         node: ET.Element,
         inherited: dict[str, dict[str, str]],
+        *,
+        is_root_default: bool,
     ) -> None:
         current = {tag: dict(attrs) for tag, attrs in inherited.items()}
         for child in node:
@@ -835,14 +837,16 @@ def _collect_default_classes(
         class_name = node.attrib.get("class")
         if class_name is not None:
             defaults[class_name] = {tag: dict(attrs) for tag, attrs in current.items()}
+        elif is_root_default:
+            defaults[""] = {tag: dict(attrs) for tag, attrs in current.items()}
 
         for child in node:
             if child.tag == "default":
-                walk_default(child, current)
+                walk_default(child, current, is_root_default=False)
 
     for _, root in roots:
         for default_node in root.findall("./default"):
-            walk_default(default_node, {})
+            walk_default(default_node, {}, is_root_default=True)
     return defaults
 
 

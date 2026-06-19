@@ -224,6 +224,34 @@ def test_mjcf_actuator_parser_records_supported_joint_actuator_kinds(
     assert model_contract.actuator_biasprm.shape == (1, 3)
 
 
+def test_mjcf_actuator_parser_inherits_unnamed_position_defaults(tmp_path: Path) -> None:
+    scene = tmp_path / "default_position_scene.xml"
+    scene.write_text(
+        """
+<mujoco model="default_position_scene">
+  <default>
+    <position kp="200000" kv="4000" inheritrange="1"/>
+  </default>
+  <worldbody>
+    <body name="body">
+      <joint name="slide" type="slide" range="0 0.7"/>
+      <geom name="geom" type="sphere" size="0.05" mass="1"/>
+    </body>
+  </worldbody>
+  <actuator>
+    <position name="a0" joint="slide"/>
+  </actuator>
+</mujoco>
+""".strip()
+    )
+
+    model_contract = parse_mjcf_model_contract(scene)
+
+    np.testing.assert_allclose(model_contract.ctrl_limits[0], [0.0, 0.7])
+    np.testing.assert_allclose(model_contract.actuator_stiffness, [200000.0])
+    np.testing.assert_allclose(model_contract.actuator_damping, [4000.0])
+
+
 @pytest.mark.parametrize(
     "actuator_xml",
     [
