@@ -13,6 +13,26 @@ This is not a full Drake backend yet. The current runtime expects UniLab tasks
 to provide the model file, base body name, robot profile label, PD gains, and
 worker count.
 
+## Directory Roles
+
+`src/drakeuni/runtime/` is the Python-facing runtime interface. It owns the
+public config/data contracts, MJCF contract parsing, Drake-compatible MJCF
+materialization, runtime construction, and the reset/step/sensor API used by
+UniLab.
+
+`src/drakeuni/compiled/` is the native extension layer. It contains the C++
+Drake batch pool source and the built pybind extension that performs batched
+physics stepping.
+
+The intended call path is:
+
+```text
+UniLab DrakeBackend
+  -> drakeuni.runtime
+      -> drakeuni.compiled.DrakeEnvPool
+          -> Drake C++ simulation
+```
+
 ## Build Batch Extension
 
 ```bash

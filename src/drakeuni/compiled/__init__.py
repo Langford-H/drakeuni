@@ -1,3 +1,10 @@
+"""Native compiled DrakeUni extension boundary.
+
+This package imports the pybind-built DrakeEnvPool when it is safe to do so.
+It intentionally stays lower-level than ``drakeuni.runtime``; application code
+should normally use the runtime API instead of importing this package directly.
+"""
+
 from __future__ import annotations
 
 import sys
