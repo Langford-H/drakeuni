@@ -13,6 +13,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "drake/geometry/scene_graph.h"
@@ -24,6 +25,7 @@
 #include "drake/multibody/parsing/parser.h"
 #include "drake/multibody/plant/externally_applied_spatial_force.h"
 #include "drake/multibody/plant/multibody_plant.h"
+#include "drake/multibody/tree/joint.h"
 #include "drake/multibody/tree/joint_actuator.h"
 #include "drake/multibody/tree/model_instance.h"
 #include "drake/multibody/tree/rigid_body.h"
@@ -38,6 +40,13 @@ namespace {
 
 constexpr int kRootQposDim = 7;
 constexpr int kRootQvelDim = 6;
+
+enum CompactJointKind {
+  kFreeJoint = 0,
+  kSlideJoint = 1,
+  kHingeJoint = 2,
+  kBallJoint = 3,
+};
 
 enum SensorKind {
   kGyro = 0,
@@ -72,7 +81,9 @@ using drake::multibody::ContactResults;
 using drake::multibody::ContactModel;
 using drake::multibody::DiscreteContactApproximation;
 using drake::multibody::ExternallyAppliedSpatialForce;
+using drake::multibody::Joint;
 using drake::multibody::JointActuatorIndex;
+using drake::multibody::JointIndex;
 using drake::multibody::ModelInstanceIndex;
 using drake::multibody::MultibodyPlant;
 using drake::multibody::Parser;
@@ -88,47 +99,94 @@ py::array_t<double> MakeArray(const std::vector<py::ssize_t>& shape) {
   return py::array_t<double>(shape);
 }
 
-Eigen::VectorXd CompactQposToDrake(const double* qpos, int nq) {
+bool AllCovered(const std::vector<bool>& covered) {
+  return std::all_of(covered.begin(), covered.end(), [](bool value) { return value; });
+}
+
+std::string NormalizeGeometryName(const std::string& name) {
+  const std::size_t separator = name.rfind("::");
+  if (separator == std::string::npos) {
+    return name;
+  }
+  return name.substr(separator + 2);
+}
+
+struct FreeJointMapping {
+  int compact_qpos{};
+  int compact_qvel{};
+  int drake_qpos{};
+  int drake_qvel{};
+};
+
+struct DirectJointMapping {
+  int compact_qpos{};
+  int compact_qvel{};
+  int drake_qpos{};
+  int drake_qvel{};
+  int qpos_dim{};
+  int qvel_dim{};
+};
+
+struct StateLayout {
+  std::vector<FreeJointMapping> free_joints;
+  std::vector<DirectJointMapping> direct_joints;
+};
+
+Eigen::VectorXd CompactQposToDrake(const double* qpos, int nq, const StateLayout& layout) {
   Eigen::VectorXd out(nq);
-  out.segment(0, 4) = Eigen::Map<const Eigen::Vector4d>(qpos + 3);
-  out.segment(4, 3) = Eigen::Map<const Eigen::Vector3d>(qpos);
-  if (nq > kRootQposDim) {
-    out.segment(kRootQposDim, nq - kRootQposDim) =
-        Eigen::Map<const Eigen::VectorXd>(qpos + kRootQposDim, nq - kRootQposDim);
+  out.setZero();
+  for (const auto& joint : layout.free_joints) {
+    out.segment(joint.drake_qpos, 4) =
+        Eigen::Map<const Eigen::Vector4d>(qpos + joint.compact_qpos + 3);
+    out.segment(joint.drake_qpos + 4, 3) =
+        Eigen::Map<const Eigen::Vector3d>(qpos + joint.compact_qpos);
+  }
+  for (const auto& joint : layout.direct_joints) {
+    out.segment(joint.drake_qpos, joint.qpos_dim) =
+        Eigen::Map<const Eigen::VectorXd>(qpos + joint.compact_qpos, joint.qpos_dim);
   }
   return out;
 }
 
-Eigen::VectorXd CompactQvelToDrake(const double* qvel, int nv) {
+Eigen::VectorXd CompactQvelToDrake(const double* qvel, int nv, const StateLayout& layout) {
   Eigen::VectorXd out(nv);
-  out.segment(0, 3) = Eigen::Map<const Eigen::Vector3d>(qvel + 3);
-  out.segment(3, 3) = Eigen::Map<const Eigen::Vector3d>(qvel);
-  if (nv > kRootQvelDim) {
-    out.segment(kRootQvelDim, nv - kRootQvelDim) =
-        Eigen::Map<const Eigen::VectorXd>(qvel + kRootQvelDim, nv - kRootQvelDim);
+  out.setZero();
+  for (const auto& joint : layout.free_joints) {
+    out.segment(joint.drake_qvel, 3) =
+        Eigen::Map<const Eigen::Vector3d>(qvel + joint.compact_qvel + 3);
+    out.segment(joint.drake_qvel + 3, 3) =
+        Eigen::Map<const Eigen::Vector3d>(qvel + joint.compact_qvel);
+  }
+  for (const auto& joint : layout.direct_joints) {
+    out.segment(joint.drake_qvel, joint.qvel_dim) =
+        Eigen::Map<const Eigen::VectorXd>(qvel + joint.compact_qvel, joint.qvel_dim);
   }
   return out;
 }
 
-void DrakeQposToCompact(const Eigen::VectorXd& qpos, double* out) {
-  Eigen::Map<Eigen::Vector3d> pos(out);
-  Eigen::Map<Eigen::Vector4d> quat(out + 3);
-  pos = qpos.segment(4, 3);
-  quat = qpos.segment(0, 4);
-  if (qpos.size() > kRootQposDim) {
-    Eigen::Map<Eigen::VectorXd> joints(out + kRootQposDim, qpos.size() - kRootQposDim);
-    joints = qpos.segment(kRootQposDim, qpos.size() - kRootQposDim);
+void DrakeQposToCompact(const Eigen::VectorXd& qpos, double* out, const StateLayout& layout) {
+  for (const auto& joint : layout.free_joints) {
+    Eigen::Map<Eigen::Vector3d> pos(out + joint.compact_qpos);
+    Eigen::Map<Eigen::Vector4d> quat(out + joint.compact_qpos + 3);
+    pos = qpos.segment(joint.drake_qpos + 4, 3);
+    quat = qpos.segment(joint.drake_qpos, 4);
+  }
+  for (const auto& joint : layout.direct_joints) {
+    Eigen::Map<Eigen::VectorXd> compact(out + joint.compact_qpos, joint.qpos_dim);
+    compact = qpos.segment(joint.drake_qpos, joint.qpos_dim);
   }
 }
 
-void DrakeQvelToCompact(const Eigen::VectorXd& qvel, double* out) {
-  Eigen::Map<Eigen::Vector3d> linear(out);
-  Eigen::Map<Eigen::Vector3d> angular(out + 3);
-  linear = qvel.segment(3, 3);
-  angular = qvel.segment(0, 3);
-  if (qvel.size() > kRootQvelDim) {
-    Eigen::Map<Eigen::VectorXd> joints(out + kRootQvelDim, qvel.size() - kRootQvelDim);
-    joints = qvel.segment(kRootQvelDim, qvel.size() - kRootQvelDim);
+void DrakeQvelToCompact(const Eigen::VectorXd& qvel, double* out, const StateLayout& layout) {
+  for (const auto& joint : layout.free_joints) {
+    Eigen::Map<Eigen::Vector3d> linear(out + joint.compact_qvel);
+    Eigen::Map<Eigen::Vector3d> angular(out + joint.compact_qvel + 3);
+    linear = qvel.segment(joint.drake_qvel + 3, 3);
+    angular = qvel.segment(joint.drake_qvel, 3);
+  }
+  for (const auto& joint : layout.direct_joints) {
+    Eigen::Map<Eigen::VectorXd> compact(out + joint.compact_qvel, joint.qvel_dim);
+    compact = qvel.segment(joint.drake_qvel, joint.qvel_dim);
   }
 }
 
@@ -161,6 +219,15 @@ class DrakeEnvPool {
                py::array_t<double, py::array::c_style | py::array::forcecast> actuator_damping,
                py::array_t<double, py::array::c_style | py::array::forcecast> actuator_gainprm,
                py::array_t<double, py::array::c_style | py::array::forcecast> actuator_biasprm,
+               py::array_t<int, py::array::c_style | py::array::forcecast> joint_layout_kind,
+               py::array_t<int, py::array::c_style | py::array::forcecast> joint_layout_qpos_adr,
+               py::array_t<int, py::array::c_style | py::array::forcecast> joint_layout_qvel_adr,
+               py::array_t<int, py::array::c_style | py::array::forcecast> joint_layout_qpos_dim,
+               py::array_t<int, py::array::c_style | py::array::forcecast> joint_layout_qvel_dim,
+               const std::vector<std::string>& joint_layout_names,
+               const std::vector<std::string>& joint_layout_body_names,
+               const std::vector<std::string>& collision_filter_geom_names1,
+               const std::vector<std::string>& collision_filter_geom_names2,
                const std::vector<int>& sensor_frame_body_indices,
                py::array_t<double, py::array::c_style | py::array::forcecast> sensor_frame_offsets,
                py::array_t<int, py::array::c_style | py::array::forcecast> sensor_type,
@@ -178,6 +245,15 @@ class DrakeEnvPool {
         actuator_damping_(std::move(actuator_damping)),
         actuator_gainprm_(std::move(actuator_gainprm)),
         actuator_biasprm_(std::move(actuator_biasprm)),
+        joint_layout_kind_(std::move(joint_layout_kind)),
+        joint_layout_qpos_adr_(std::move(joint_layout_qpos_adr)),
+        joint_layout_qvel_adr_(std::move(joint_layout_qvel_adr)),
+        joint_layout_qpos_dim_(std::move(joint_layout_qpos_dim)),
+        joint_layout_qvel_dim_(std::move(joint_layout_qvel_dim)),
+        joint_layout_names_(joint_layout_names),
+        joint_layout_body_names_(joint_layout_body_names),
+        collision_filter_geom_names1_(collision_filter_geom_names1),
+        collision_filter_geom_names2_(collision_filter_geom_names2),
         sensor_frame_body_indices_(sensor_frame_body_indices),
         sensor_frame_offsets_(std::move(sensor_frame_offsets)),
         sensor_type_(std::move(sensor_type)),
@@ -201,6 +277,22 @@ class DrakeEnvPool {
     RequireShape(actuator_damping_.request(), {nu_}, "actuator_damping");
     RequireShape(actuator_gainprm_.request(), {nu_, 3}, "actuator_gainprm");
     RequireShape(actuator_biasprm_.request(), {nu_, 3}, "actuator_biasprm");
+    const auto joint_layout_info = joint_layout_kind_.request();
+    if (joint_layout_info.ndim != 1) {
+      throw std::invalid_argument("joint_layout_kind must be one-dimensional");
+    }
+    const py::ssize_t joint_layout_count = joint_layout_info.shape[0];
+    RequireShape(joint_layout_qpos_adr_.request(), {joint_layout_count}, "joint_layout_qpos_adr");
+    RequireShape(joint_layout_qvel_adr_.request(), {joint_layout_count}, "joint_layout_qvel_adr");
+    RequireShape(joint_layout_qpos_dim_.request(), {joint_layout_count}, "joint_layout_qpos_dim");
+    RequireShape(joint_layout_qvel_dim_.request(), {joint_layout_count}, "joint_layout_qvel_dim");
+    if (joint_layout_names_.size() != static_cast<std::size_t>(joint_layout_count) ||
+        joint_layout_body_names_.size() != static_cast<std::size_t>(joint_layout_count)) {
+      throw std::invalid_argument("joint layout name vectors must match joint layout arrays");
+    }
+    if (collision_filter_geom_names1_.size() != collision_filter_geom_names2_.size()) {
+      throw std::invalid_argument("collision filter geom name vectors must have equal length");
+    }
     RequireShape(sensor_frame_offsets_.request(),
                  {static_cast<py::ssize_t>(sensor_frame_body_indices_.size()), 3},
                  "sensor_frame_offsets");
@@ -254,9 +346,9 @@ class DrakeEnvPool {
       }
     }
 
-    // Drake's MJCF parser does not honor MuJoCo contype/conaffinity here, so
-    // exclude robot self-collisions before Finalize().
-    num_filtered_geometries_ = ExcludeRobotSelfCollisions();
+    // Drake's MJCF parser warns that it ignores MuJoCo contype/conaffinity.
+    // Apply the same mask rule ourselves before Finalize().
+    num_filtered_geometries_ = ApplyMjcfCollisionFilters();
     plant_->Finalize();
     CacheActuatorJointIndices();
     for (int frame_body_index : sensor_frame_body_indices_) {
@@ -267,6 +359,7 @@ class DrakeEnvPool {
     nq_ = plant_->num_positions();
     nv_ = plant_->num_velocities();
     state_dim_ = 1 + nq_ + nv_;
+    BuildStateLayout();
     if (nu_ != plant_->num_actuators()) {
       throw std::runtime_error("ctrl_limits length does not match plant actuators");
     }
@@ -296,8 +389,8 @@ class DrakeEnvPool {
     state(0) = runtime.simulator->get_context().get_time();
     const Eigen::VectorXd q = plant_->GetPositions(*runtime.plant_context);
     const Eigen::VectorXd v = plant_->GetVelocities(*runtime.plant_context);
-    DrakeQposToCompact(q, &state(1));
-    DrakeQvelToCompact(v, &state(1 + nq_));
+    DrakeQposToCompact(q, &state(1), state_layout_);
+    DrakeQvelToCompact(v, &state(1 + nq_), state_layout_);
     return state_out;
   }
 
@@ -434,6 +527,132 @@ class DrakeEnvPool {
   }
 
  private:
+  void MarkCovered(std::vector<bool>& covered, int start, int dim,
+                   const std::string& description) const {
+    if (start < 0 || dim < 0 || start + dim > static_cast<int>(covered.size())) {
+      throw std::runtime_error(description + " is outside compact/Drake state bounds");
+    }
+    for (int i = start; i < start + dim; ++i) {
+      if (covered.at(i)) {
+        throw std::runtime_error(description + " overlaps another compact/Drake state segment");
+      }
+      covered.at(i) = true;
+    }
+  }
+
+  const Joint<double>& FindJointByChildBody(const std::string& body_name,
+                                            int qpos_dim, int qvel_dim) const {
+    const Joint<double>* match = nullptr;
+    for (int i = 0; i < plant_->num_joints(); ++i) {
+      const Joint<double>& joint = plant_->get_joint(JointIndex(i));
+      if (joint.num_positions() != qpos_dim || joint.num_velocities() != qvel_dim) {
+        continue;
+      }
+      if (joint.child_body().name() != body_name) {
+        continue;
+      }
+      if (match != nullptr) {
+        throw std::runtime_error("Multiple Drake joints match MJCF child body " + body_name);
+      }
+      match = &joint;
+    }
+    if (match == nullptr) {
+      throw std::runtime_error("Could not map MJCF joint on child body " + body_name +
+                               " into Drake state layout");
+    }
+    return *match;
+  }
+
+  void BuildStateLayout() {
+    const auto kind = joint_layout_kind_.unchecked<1>();
+    const auto qpos_adr = joint_layout_qpos_adr_.unchecked<1>();
+    const auto qvel_adr = joint_layout_qvel_adr_.unchecked<1>();
+    const auto qpos_dim = joint_layout_qpos_dim_.unchecked<1>();
+    const auto qvel_dim = joint_layout_qvel_dim_.unchecked<1>();
+    const int joint_count = static_cast<int>(joint_layout_names_.size());
+
+    std::vector<const Joint<double>*> one_dof_joints;
+    for (int i = 0; i < plant_->num_joints(); ++i) {
+      const Joint<double>& joint = plant_->get_joint(JointIndex(i));
+      if (joint.num_positions() == 1 && joint.num_velocities() == 1) {
+        one_dof_joints.push_back(&joint);
+      }
+    }
+    std::sort(one_dof_joints.begin(), one_dof_joints.end(),
+              [](const Joint<double>* lhs, const Joint<double>* rhs) {
+                return lhs->position_start() < rhs->position_start();
+              });
+
+    std::vector<bool> compact_qpos_covered(nq_, false);
+    std::vector<bool> compact_qvel_covered(nv_, false);
+    std::vector<bool> drake_qpos_covered(nq_, false);
+    std::vector<bool> drake_qvel_covered(nv_, false);
+    int one_dof_cursor = 0;
+
+    for (int i = 0; i < joint_count; ++i) {
+      const int compact_q = qpos_adr(i);
+      const int compact_v = qvel_adr(i);
+      const int q_dim = qpos_dim(i);
+      const int v_dim = qvel_dim(i);
+      MarkCovered(compact_qpos_covered, compact_q, q_dim, "MJCF compact qpos layout");
+      MarkCovered(compact_qvel_covered, compact_v, v_dim, "MJCF compact qvel layout");
+
+      if (kind(i) == kFreeJoint) {
+        const Joint<double>& joint =
+            FindJointByChildBody(joint_layout_body_names_.at(i), kRootQposDim, kRootQvelDim);
+        state_layout_.free_joints.push_back(FreeJointMapping{
+            compact_q, compact_v, joint.position_start(), joint.velocity_start()});
+        MarkCovered(drake_qpos_covered, joint.position_start(), kRootQposDim,
+                    "Drake free-joint qpos layout");
+        MarkCovered(drake_qvel_covered, joint.velocity_start(), kRootQvelDim,
+                    "Drake free-joint qvel layout");
+        continue;
+      }
+
+      if (kind(i) == kBallJoint) {
+        const Joint<double>& joint = FindJointByChildBody(joint_layout_body_names_.at(i), 4, 3);
+        state_layout_.direct_joints.push_back(
+            DirectJointMapping{compact_q, compact_v, joint.position_start(),
+                               joint.velocity_start(), q_dim, v_dim});
+        MarkCovered(drake_qpos_covered, joint.position_start(), q_dim,
+                    "Drake ball-joint qpos layout");
+        MarkCovered(drake_qvel_covered, joint.velocity_start(), v_dim,
+                    "Drake ball-joint qvel layout");
+        continue;
+      }
+
+      if (kind(i) != kSlideJoint && kind(i) != kHingeJoint) {
+        throw std::runtime_error("Unknown MJCF compact joint kind in DrakeUni state layout");
+      }
+      if (one_dof_cursor >= static_cast<int>(one_dof_joints.size())) {
+        throw std::runtime_error("MJCF compact state has more one-dof joints than Drake plant");
+      }
+      const Joint<double>& joint = *one_dof_joints.at(one_dof_cursor++);
+      const std::string& compact_name = joint_layout_names_.at(i);
+      if (!compact_name.empty() && joint.name() != compact_name) {
+        throw std::runtime_error("MJCF one-dof joint " + compact_name +
+                                 " mapped to unexpected Drake joint " + joint.name());
+      }
+      state_layout_.direct_joints.push_back(
+          DirectJointMapping{compact_q, compact_v, joint.position_start(),
+                             joint.velocity_start(), q_dim, v_dim});
+      MarkCovered(drake_qpos_covered, joint.position_start(), q_dim,
+                  "Drake one-dof qpos layout");
+      MarkCovered(drake_qvel_covered, joint.velocity_start(), v_dim,
+                  "Drake one-dof qvel layout");
+    }
+
+    if (one_dof_cursor != static_cast<int>(one_dof_joints.size())) {
+      throw std::runtime_error(
+          "Drake plant has one-dof joints missing from MJCF compact layout");
+    }
+    if (!AllCovered(compact_qpos_covered) || !AllCovered(compact_qvel_covered) ||
+        !AllCovered(drake_qpos_covered) || !AllCovered(drake_qvel_covered)) {
+      throw std::runtime_error(
+          "DrakeUni compact/Drake state layout did not cover all qpos/qvel entries");
+    }
+  }
+
   ThreadWorkspace MakeWorkspace() {
     ThreadWorkspace runtime;
     auto context = diagram_->CreateDefaultContext();
@@ -457,8 +676,10 @@ class DrakeEnvPool {
       }
     }
     runtime.simulator->get_mutable_context().SetTime(state_row[0]);
-    plant_->SetPositions(runtime.plant_context, CompactQposToDrake(state_row + 1, nq_));
-    plant_->SetVelocities(runtime.plant_context, CompactQvelToDrake(state_row + 1 + nq_, nv_));
+    plant_->SetPositions(runtime.plant_context,
+                         CompactQposToDrake(state_row + 1, nq_, state_layout_));
+    plant_->SetVelocities(runtime.plant_context,
+                          CompactQvelToDrake(state_row + 1 + nq_, nv_, state_layout_));
     if (nu_ > 0) {
       SetNeutralActuatorInputs(runtime.plant_context);
       std::fill(runtime.last_actuator_effort.begin(), runtime.last_actuator_effort.end(), 0.0);
@@ -629,8 +850,8 @@ class DrakeEnvPool {
     state(env_index, 0) = runtime.simulator->get_context().get_time();
     Eigen::VectorXd q = plant_->GetPositions(*runtime.plant_context);
     Eigen::VectorXd v = plant_->GetVelocities(*runtime.plant_context);
-    DrakeQposToCompact(q, &state(env_index, 1));
-    DrakeQvelToCompact(v, &state(env_index, 1 + nq_));
+    DrakeQposToCompact(q, &state(env_index, 1), state_layout_);
+    DrakeQvelToCompact(v, &state(env_index, 1 + nq_), state_layout_);
     SaveCompactState(env_index, &state(env_index, 0));
   }
 
@@ -904,19 +1125,34 @@ class DrakeEnvPool {
     return compact_state_.data() + static_cast<std::size_t>(env_index) * state_dim_;
   }
 
-  int ExcludeRobotSelfCollisions() {
-    std::vector<const RigidBody<double>*> bodies;
-    for (BodyIndex body_index : plant_->GetBodyIndices(model_instance_)) {
-      bodies.push_back(&plant_->get_body(body_index));
+  int ApplyMjcfCollisionFilters() {
+    std::unordered_map<std::string, drake::geometry::GeometryId> geometry_by_name;
+    const auto& inspector = scene_graph_->model_inspector();
+    for (int body_index = 0; body_index < plant_->num_bodies(); ++body_index) {
+      const RigidBody<double>& body = plant_->get_body(BodyIndex(body_index));
+      for (const auto& geometry_id : plant_->GetCollisionGeometriesForBody(body)) {
+        const std::string name = NormalizeGeometryName(inspector.GetName(geometry_id));
+        if (!geometry_by_name.emplace(name, geometry_id).second) {
+          throw std::runtime_error("Duplicate Drake collision geometry name after normalization: " +
+                                   name);
+        }
+      }
     }
+
     int count = 0;
-    for (const RigidBody<double>* body : bodies) {
-      count += static_cast<int>(plant_->GetCollisionGeometriesForBody(*body).size());
-    }
-    if (count > 0) {
-      GeometrySet robot_geometries = plant_->CollectRegisteredGeometries(bodies);
+    for (std::size_t pair = 0; pair < collision_filter_geom_names1_.size(); ++pair) {
+      const std::string& name_a = collision_filter_geom_names1_.at(pair);
+      const std::string& name_b = collision_filter_geom_names2_.at(pair);
+      auto geom_a = geometry_by_name.find(name_a);
+      auto geom_b = geometry_by_name.find(name_b);
+      if (geom_a == geometry_by_name.end() || geom_b == geometry_by_name.end()) {
+        throw std::runtime_error("Could not apply MJCF collision filter for geoms " + name_a +
+                                 " and " + name_b + "; geometry was not found in Drake");
+      }
       scene_graph_->collision_filter_manager().Apply(
-          CollisionFilterDeclaration().ExcludeWithin(std::move(robot_geometries)));
+          CollisionFilterDeclaration().ExcludeBetween(GeometrySet(geom_a->second),
+                                                     GeometrySet(geom_b->second)));
+      ++count;
     }
     return count;
   }
@@ -966,6 +1202,16 @@ class DrakeEnvPool {
   py::array_t<double> actuator_damping_;
   py::array_t<double> actuator_gainprm_;
   py::array_t<double> actuator_biasprm_;
+  py::array_t<int> joint_layout_kind_;
+  py::array_t<int> joint_layout_qpos_adr_;
+  py::array_t<int> joint_layout_qvel_adr_;
+  py::array_t<int> joint_layout_qpos_dim_;
+  py::array_t<int> joint_layout_qvel_dim_;
+  std::vector<std::string> joint_layout_names_;
+  std::vector<std::string> joint_layout_body_names_;
+  std::vector<std::string> collision_filter_geom_names1_;
+  std::vector<std::string> collision_filter_geom_names2_;
+  StateLayout state_layout_;
   std::vector<int> sensor_frame_body_indices_;
   py::array_t<double> sensor_frame_offsets_;
   py::array_t<int> sensor_type_;
@@ -1000,21 +1246,35 @@ PYBIND11_MODULE(_drake_env_pool, m) {
                     py::array_t<double, py::array::c_style | py::array::forcecast>,
                     py::array_t<int, py::array::c_style | py::array::forcecast>,
                     py::array_t<double, py::array::c_style | py::array::forcecast>,
-                    py::array_t<double, py::array::c_style | py::array::forcecast>,
-                    py::array_t<double, py::array::c_style | py::array::forcecast>,
-                    py::array_t<double, py::array::c_style | py::array::forcecast>,
-                    py::array_t<double, py::array::c_style | py::array::forcecast>,
+                      py::array_t<double, py::array::c_style | py::array::forcecast>,
+                      py::array_t<double, py::array::c_style | py::array::forcecast>,
+                      py::array_t<double, py::array::c_style | py::array::forcecast>,
+                      py::array_t<double, py::array::c_style | py::array::forcecast>,
+                      py::array_t<int, py::array::c_style | py::array::forcecast>,
+                      py::array_t<int, py::array::c_style | py::array::forcecast>,
+                      py::array_t<int, py::array::c_style | py::array::forcecast>,
+                      py::array_t<int, py::array::c_style | py::array::forcecast>,
+                    py::array_t<int, py::array::c_style | py::array::forcecast>,
+                    const std::vector<std::string>&,
+                    const std::vector<std::string>&,
+                    const std::vector<std::string>&,
+                    const std::vector<std::string>&,
                     const std::vector<int>&,
-                    py::array_t<double, py::array::c_style | py::array::forcecast>,
+                      py::array_t<double, py::array::c_style | py::array::forcecast>,
                     py::array_t<int, py::array::c_style | py::array::forcecast>,
                     py::array_t<int, py::array::c_style | py::array::forcecast>,
                     py::array_t<int, py::array::c_style | py::array::forcecast>,
                     py::array_t<int, py::array::c_style | py::array::forcecast>, int, int>(),
            py::arg("model_file"), py::arg("nbatch"), py::arg("sim_dt"),
            py::arg("ctrl_limits"), py::arg("torque_limits"),
-           py::arg("actuator_kind"), py::arg("actuator_gear"),
-           py::arg("actuator_stiffness"), py::arg("actuator_damping"),
-           py::arg("actuator_gainprm"), py::arg("actuator_biasprm"),
+             py::arg("actuator_kind"), py::arg("actuator_gear"),
+             py::arg("actuator_stiffness"), py::arg("actuator_damping"),
+             py::arg("actuator_gainprm"), py::arg("actuator_biasprm"),
+             py::arg("joint_layout_kind"), py::arg("joint_layout_qpos_adr"),
+           py::arg("joint_layout_qvel_adr"), py::arg("joint_layout_qpos_dim"),
+           py::arg("joint_layout_qvel_dim"), py::arg("joint_layout_names"),
+           py::arg("joint_layout_body_names"),
+           py::arg("collision_filter_geom_names1"), py::arg("collision_filter_geom_names2"),
            py::arg("sensor_frame_body_indices"),
            py::arg("sensor_frame_offsets"),
            py::arg("sensor_type"), py::arg("sensor_index"), py::arg("sensor_adr"),

@@ -36,10 +36,10 @@ class DrakeBatchRuntime:
         self._num_envs = int(config.num_envs)
         self._sim_dt = float(config.sim_dt)
         self._model_file = str(Path(config.model_file).expanduser())
-        self._model_contract = parse_mjcf_model_contract(self._model_file)
         self._drake_model: DrakeCompatibleMjcf = materialize_drake_compatible_mjcf(
             self._model_file
         )
+        self._model_contract = parse_mjcf_model_contract(self._drake_model.model_file)
         self._nthread = _resolve_nthread(self._num_envs, int(config.nthread))
         sensor_frame_body_indices, sensor_frame_offsets = sensor_frames_as_pool_inputs(
             self._model_contract
@@ -56,6 +56,15 @@ class DrakeBatchRuntime:
             self._model_contract.actuator_damping,
             self._model_contract.actuator_gainprm,
             self._model_contract.actuator_biasprm,
+            self._model_contract.joint_layout_kind,
+            self._model_contract.joint_layout_qpos_adr,
+            self._model_contract.joint_layout_qvel_adr,
+            self._model_contract.joint_layout_qpos_dim,
+            self._model_contract.joint_layout_qvel_dim,
+            self._model_contract.joint_layout_names,
+            self._model_contract.joint_layout_body_names,
+            self._model_contract.collision_filter_geom_names1,
+            self._model_contract.collision_filter_geom_names2,
             sensor_frame_body_indices,
             sensor_frame_offsets,
             self._model_contract.sensor_type,

@@ -33,6 +33,11 @@ ACTUATOR_KIND_MOTOR = 2
 ACTUATOR_KIND_DAMPER = 3
 ACTUATOR_KIND_GENERAL = 4
 
+JOINT_KIND_FREE = 0
+JOINT_KIND_SLIDE = 1
+JOINT_KIND_HINGE = 2
+JOINT_KIND_BALL = 3
+
 FRAME_SENSOR_KIND_BY_TAG = {
     "gyro": SENSOR_KIND_GYRO,
     "accelerometer": SENSOR_KIND_ACCELEROMETER,
@@ -174,9 +179,32 @@ class MjcfActuatorContract:
 
 
 @dataclass(frozen=True)
+class MjcfGeomCollisionContract:
+    name: str
+    contype: int
+    conaffinity: int
+
+    def collides_with(self, other: "MjcfGeomCollisionContract") -> bool:
+        return bool((self.contype & other.conaffinity) or (other.contype & self.conaffinity))
+
+
+@dataclass(frozen=True)
+class MjcfJointLayout:
+    name: str
+    body_name: str
+    kind: int
+    qpos_adr: int
+    qvel_adr: int
+    qpos_dim: int
+    qvel_dim: int
+
+
+@dataclass(frozen=True)
 class DrakeMjcfModelContract:
     name: str
     body_indices: dict[str, int]
+    joint_layouts: tuple[MjcfJointLayout, ...]
+    collision_geoms: tuple[MjcfGeomCollisionContract, ...]
     actuators: tuple[MjcfActuatorContract, ...]
     num_bodies: int
     frame_sensors: tuple[MjcfFrameSensorContract, ...]
@@ -218,6 +246,51 @@ class DrakeMjcfModelContract:
     @property
     def joint_ranges(self) -> np.ndarray:
         return np.asarray([actuator.joint_range for actuator in self.actuators], dtype=np.float64)
+
+    @property
+    def joint_layout_kind(self) -> np.ndarray:
+        return np.asarray([layout.kind for layout in self.joint_layouts], dtype=np.int32)
+
+    @property
+    def joint_layout_qpos_adr(self) -> np.ndarray:
+        return np.asarray([layout.qpos_adr for layout in self.joint_layouts], dtype=np.int32)
+
+    @property
+    def joint_layout_qvel_adr(self) -> np.ndarray:
+        return np.asarray([layout.qvel_adr for layout in self.joint_layouts], dtype=np.int32)
+
+    @property
+    def joint_layout_qpos_dim(self) -> np.ndarray:
+        return np.asarray([layout.qpos_dim for layout in self.joint_layouts], dtype=np.int32)
+
+    @property
+    def joint_layout_qvel_dim(self) -> np.ndarray:
+        return np.asarray([layout.qvel_dim for layout in self.joint_layouts], dtype=np.int32)
+
+    @property
+    def joint_layout_names(self) -> tuple[str, ...]:
+        return tuple(layout.name for layout in self.joint_layouts)
+
+    @property
+    def joint_layout_body_names(self) -> tuple[str, ...]:
+        return tuple(layout.body_name for layout in self.joint_layouts)
+
+    @property
+    def collision_filter_geom_pairs(self) -> tuple[tuple[str, str], ...]:
+        pairs: list[tuple[str, str]] = []
+        for index, geom in enumerate(self.collision_geoms):
+            for other in self.collision_geoms[index + 1 :]:
+                if not geom.collides_with(other):
+                    pairs.append((geom.name, other.name))
+        return tuple(pairs)
+
+    @property
+    def collision_filter_geom_names1(self) -> tuple[str, ...]:
+        return tuple(pair[0] for pair in self.collision_filter_geom_pairs)
+
+    @property
+    def collision_filter_geom_names2(self) -> tuple[str, ...]:
+        return tuple(pair[1] for pair in self.collision_filter_geom_pairs)
 
     @property
     def frame_position_sensors(self) -> tuple[MjcfFrameSensorContract, ...]:
@@ -321,6 +394,8 @@ def parse_mjcf_model_contract(scene_path: str | Path) -> DrakeMjcfModelContract:
     roots = _load_xml_roots(path)
     defaults = _collect_default_classes(roots)
     body_indices = _extract_body_indices(roots)
+    joint_layouts = _extract_joint_layouts(roots, defaults)
+    collision_geoms = _extract_geom_collision_fields(roots, defaults)
     joint_ranges_by_name = _extract_joint_ranges(roots, defaults)
     actuators = _extract_actuator_contract_fields(
         roots,
@@ -336,6 +411,8 @@ def parse_mjcf_model_contract(scene_path: str | Path) -> DrakeMjcfModelContract:
     return DrakeMjcfModelContract(
         name=roots[0][1].attrib.get("model", path.stem),
         body_indices=body_indices,
+        joint_layouts=joint_layouts,
+        collision_geoms=collision_geoms,
         actuators=actuators,
         num_bodies=max(body_indices.values(), default=0) + 1,
         frame_sensors=frame_sensors,
@@ -657,8 +734,10 @@ def _expand_mjcf_defaults_in_file(
     root = tree.getroot()
     if root.tag == "mujoco" and not root.attrib.get("model"):
         root.attrib["model"] = path.stem
+    generated_geom_index = 0
 
     def walk_body(body: ET.Element, inherited_class: str | None) -> None:
+        nonlocal generated_geom_index
         element_class = body.attrib.get("childclass", inherited_class)
         for child in list(body):
             if child.tag in {"joint", "geom", "site"}:
@@ -667,6 +746,9 @@ def _expand_mjcf_defaults_in_file(
                 if child.tag == "geom" and _is_noncolliding_geom(attrs):
                     body.remove(child)
                     continue
+                if child.tag == "geom" and not attrs.get("name"):
+                    attrs["name"] = f"drakeuni_{path.parent.name}_{path.stem}_geom_{generated_geom_index}"
+                    generated_geom_index += 1
                 child.attrib.clear()
                 child.attrib.update(attrs)
             elif child.tag == "body":
@@ -857,6 +939,139 @@ def _extract_joint_ranges(
         for body in root.findall("./worldbody/body"):
             walk_body(body, None)
     return ranges
+
+
+def _extract_geom_collision_fields(
+    roots: Sequence[tuple[Path, ET.Element]],
+    defaults: dict[str, dict[str, dict[str, str]]],
+) -> tuple[MjcfGeomCollisionContract, ...]:
+    geoms: list[MjcfGeomCollisionContract] = []
+    generated_geom_index = 0
+
+    def append_geom(attrs: dict[str, str]) -> None:
+        nonlocal generated_geom_index
+        if _is_noncolliding_geom(attrs):
+            return
+        name = attrs.get("name")
+        if not name:
+            name = f"geom{generated_geom_index}"
+            generated_geom_index += 1
+        geoms.append(
+            MjcfGeomCollisionContract(
+                name=name,
+                contype=int(attrs.get("contype", "1")),
+                conaffinity=int(attrs.get("conaffinity", "1")),
+            )
+        )
+
+    def walk_body(body: ET.Element, inherited_class: str | None) -> None:
+        element_class = body.attrib.get("childclass", inherited_class)
+        for geom in body.findall("./geom"):
+            attrs = _merged_default_attrs(
+                defaults,
+                geom.attrib.get("class", element_class),
+                "geom",
+                geom.attrib,
+            )
+            append_geom(attrs)
+        for child in body.findall("./body"):
+            walk_body(child, element_class)
+
+    for _, root in roots:
+        for geom in root.findall("./worldbody/geom"):
+            attrs = _merged_default_attrs(defaults, geom.attrib.get("class"), "geom", geom.attrib)
+            append_geom(attrs)
+        for body in root.findall("./worldbody/body"):
+            walk_body(body, None)
+
+    names = [geom.name for geom in geoms]
+    if len(names) != len(set(names)):
+        duplicates = sorted({name for name in names if names.count(name) > 1})
+        raise ValueError(f"Duplicate MJCF collision geom names: {duplicates}")
+    return tuple(geoms)
+
+
+def _extract_joint_layouts(
+    roots: Sequence[tuple[Path, ET.Element]],
+    defaults: dict[str, dict[str, dict[str, str]]],
+) -> tuple[MjcfJointLayout, ...]:
+    layouts: list[MjcfJointLayout] = []
+    qpos_adr = 0
+    qvel_adr = 0
+
+    def append_joint(
+        *,
+        name: str,
+        body_name: str,
+        joint_type: str,
+    ) -> None:
+        nonlocal qpos_adr, qvel_adr
+        if joint_type == "free":
+            kind = JOINT_KIND_FREE
+            qpos_dim = 7
+            qvel_dim = 6
+        elif joint_type == "slide":
+            kind = JOINT_KIND_SLIDE
+            qpos_dim = 1
+            qvel_dim = 1
+        elif joint_type == "hinge":
+            kind = JOINT_KIND_HINGE
+            qpos_dim = 1
+            qvel_dim = 1
+        elif joint_type == "ball":
+            kind = JOINT_KIND_BALL
+            qpos_dim = 4
+            qvel_dim = 3
+        else:
+            raise ValueError(f"DrakeUni does not support MJCF joint type {joint_type!r}")
+        layouts.append(
+            MjcfJointLayout(
+                name=name,
+                body_name=body_name,
+                kind=kind,
+                qpos_adr=qpos_adr,
+                qvel_adr=qvel_adr,
+                qpos_dim=qpos_dim,
+                qvel_dim=qvel_dim,
+            )
+        )
+        qpos_adr += qpos_dim
+        qvel_adr += qvel_dim
+
+    def walk_body(body: ET.Element, inherited_class: str | None) -> None:
+        body_name = body.attrib.get("name", "")
+        element_class = body.attrib.get("childclass", inherited_class)
+        for child in body:
+            if child.tag == "freejoint":
+                if not body_name:
+                    raise ValueError("DrakeUni requires named MJCF bodies for freejoint state layout")
+                append_joint(
+                    name=child.attrib.get("name", ""),
+                    body_name=body_name,
+                    joint_type="free",
+                )
+            elif child.tag == "joint":
+                attrs = _merged_default_attrs(
+                    defaults,
+                    child.attrib.get("class", element_class),
+                    "joint",
+                    child.attrib,
+                )
+                joint_type = attrs.get("type", "hinge").strip().lower()
+                if joint_type == "free" and not body_name:
+                    raise ValueError("DrakeUni requires named MJCF bodies for free joint state layout")
+                append_joint(
+                    name=attrs.get("name", ""),
+                    body_name=body_name,
+                    joint_type=joint_type,
+                )
+        for child in body.findall("./body"):
+            walk_body(child, element_class)
+
+    for _, root in roots:
+        for body in root.findall("./worldbody/body"):
+            walk_body(body, None)
+    return tuple(layouts)
 
 
 def _extract_named_frames(
