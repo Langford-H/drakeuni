@@ -9,9 +9,10 @@ Current scope:
 - Python API modeled after MuJoCoUni's `BatchEnvPool` direction.
 - Intended to be consumed by UniLab's Drake backend adapter.
 
-This is not a full Drake backend yet. The current runtime expects UniLab tasks
-to provide the model file, base body name, robot profile label, PD gains, and
-worker count.
+This is not a full Drake backend yet. The current runtime expects a model file,
+environment count, simulation step size, and worker count. Task semantics such
+as base-body meaning, named sensor views, rewards, and observations belong to
+the consuming UniLab backend/task layer.
 
 ## Directory Roles
 
@@ -52,16 +53,13 @@ uv pip install -e /Users/huanghaochen/solver/drakeuni
 ## Runtime API
 
 ```python
-from drakeuni.runtime import DrakeRuntimeConfig, create_runtime
+from drakeuni.runtime import DrakeBatchConfig, create_runtime
 
 runtime = create_runtime(
-    DrakeRuntimeConfig(
+    DrakeBatchConfig(
         model_file="/path/to/scene_flat_drake.xml",
         num_envs=32,
         sim_dt=0.002,
-        mode="batch",
-        base_name="base",
-        robot_profile="my_robot",
         nthread=8,
     )
 )
