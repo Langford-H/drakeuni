@@ -230,6 +230,9 @@ class DrakeEnvPool {
                const std::vector<std::string>& collision_filter_geom_names2,
                const std::vector<int>& sensor_frame_body_indices,
                py::array_t<double, py::array::c_style | py::array::forcecast> sensor_frame_offsets,
+               const std::vector<int>& sensor_frame_ref_body_indices,
+               py::array_t<double, py::array::c_style | py::array::forcecast>
+                   sensor_frame_ref_offsets,
                py::array_t<int, py::array::c_style | py::array::forcecast> sensor_type,
                py::array_t<int, py::array::c_style | py::array::forcecast> sensor_index,
                py::array_t<int, py::array::c_style | py::array::forcecast> sensor_adr,
@@ -256,6 +259,8 @@ class DrakeEnvPool {
         collision_filter_geom_names2_(collision_filter_geom_names2),
         sensor_frame_body_indices_(sensor_frame_body_indices),
         sensor_frame_offsets_(std::move(sensor_frame_offsets)),
+        sensor_frame_ref_body_indices_(sensor_frame_ref_body_indices),
+        sensor_frame_ref_offsets_(std::move(sensor_frame_ref_offsets)),
         sensor_type_(std::move(sensor_type)),
         sensor_index_(std::move(sensor_index)),
         sensor_adr_(std::move(sensor_adr)),
@@ -293,9 +298,15 @@ class DrakeEnvPool {
     if (collision_filter_geom_names1_.size() != collision_filter_geom_names2_.size()) {
       throw std::invalid_argument("collision filter geom name vectors must have equal length");
     }
-    RequireShape(sensor_frame_offsets_.request(),
-                 {static_cast<py::ssize_t>(sensor_frame_body_indices_.size()), 3},
-                 "sensor_frame_offsets");
+    const py::ssize_t frame_count =
+        static_cast<py::ssize_t>(sensor_frame_body_indices_.size());
+    RequireShape(sensor_frame_offsets_.request(), {frame_count, 3}, "sensor_frame_offsets");
+    if (sensor_frame_ref_body_indices_.size() != sensor_frame_body_indices_.size()) {
+      throw std::invalid_argument(
+          "sensor_frame_ref_body_indices must match sensor_frame_body_indices");
+    }
+    RequireShape(sensor_frame_ref_offsets_.request(), {frame_count, 3},
+                 "sensor_frame_ref_offsets");
     const auto sensor_type_info = sensor_type_.request();
     if (sensor_type_info.ndim != 1) {
       throw std::invalid_argument("sensor_type must be one-dimensional");
@@ -353,6 +364,13 @@ class DrakeEnvPool {
     CacheActuatorJointIndices();
     for (int frame_body_index : sensor_frame_body_indices_) {
       sensor_frame_bodies_.push_back(&plant_->get_body(BodyIndex(frame_body_index)));
+    }
+    for (int frame_body_index : sensor_frame_ref_body_indices_) {
+      if (frame_body_index < 0) {
+        sensor_frame_ref_bodies_.push_back(nullptr);
+      } else {
+        sensor_frame_ref_bodies_.push_back(&plant_->get_body(BodyIndex(frame_body_index)));
+      }
     }
     diagram_ = builder.Build();
 
@@ -465,19 +483,43 @@ class DrakeEnvPool {
     }
     const int rows = static_cast<int>(ids_info.shape[0]);
     RequireShape(initial_state.request(), {rows, state_dim_}, "initial_state");
-    {
-      py::gil_scoped_release release;
-      auto ids = env_ids.unchecked<1>();
-      auto state = initial_state.unchecked<2>();
-      for (int row = 0; row < rows; ++row) {
-        const int env_index = ids(row);
-        if (env_index < 0 || env_index >= nbatch_) {
-          throw std::out_of_range("env_id out of range");
-        }
-        SaveCompactState(env_index, &state(row, 0));
+    auto ids = env_ids.unchecked<1>();
+    for (int row = 0; row < rows; ++row) {
+      const int env_index = ids(row);
+      if (env_index < 0 || env_index >= nbatch_) {
+        throw std::out_of_range("env_id out of range");
       }
     }
-    return Snapshot(return_sensor);
+
+    auto state_rows = MakeArray({rows, state_dim_});
+    py::array_t<double> sensor_rows;
+    if (return_sensor) {
+      sensor_rows = MakeArray({rows, nsensordata_});
+    }
+    {
+      py::gil_scoped_release release;
+      auto state = initial_state.unchecked<2>();
+      auto worker = [&](int thread_index, int begin, int end) {
+        auto& workspace = workspaces_.at(thread_index);
+        for (int row = begin; row < end; ++row) {
+          const int env_index = ids(row);
+          LoadState(workspace, &state(row, 0));
+          WriteCompactStateRow(workspace, row, state_rows);
+          SaveCompactState(env_index, &state_rows.mutable_unchecked<2>()(row, 0));
+          if (return_sensor) {
+            WriteSensorRow(workspace, row, sensor_rows);
+          }
+        }
+      };
+      RunRowChunks(rows, worker);
+    }
+    py::dict output;
+    output["env_ids"] = env_ids;
+    output["state"] = state_rows;
+    if (return_sensor) {
+      output["sensor_data"] = sensor_rows;
+    }
+    return output;
   }
 
   py::dict snapshot(bool return_sensor) { return Snapshot(return_sensor); }
@@ -846,13 +888,18 @@ class DrakeEnvPool {
   }
 
   void WriteState(const ThreadWorkspace& runtime, int env_index, py::array_t<double>& state_out) {
+    WriteCompactStateRow(runtime, env_index, state_out);
+    SaveCompactState(env_index, &state_out.mutable_unchecked<2>()(env_index, 0));
+  }
+
+  void WriteCompactStateRow(const ThreadWorkspace& runtime, int row,
+                            py::array_t<double>& state_out) const {
     auto state = state_out.mutable_unchecked<2>();
-    state(env_index, 0) = runtime.simulator->get_context().get_time();
+    state(row, 0) = runtime.simulator->get_context().get_time();
     Eigen::VectorXd q = plant_->GetPositions(*runtime.plant_context);
     Eigen::VectorXd v = plant_->GetVelocities(*runtime.plant_context);
-    DrakeQposToCompact(q, &state(env_index, 1), state_layout_);
-    DrakeQvelToCompact(v, &state(env_index, 1 + nq_), state_layout_);
-    SaveCompactState(env_index, &state(env_index, 0));
+    DrakeQposToCompact(q, &state(row, 1), state_layout_);
+    DrakeQvelToCompact(v, &state(row, 1 + nq_), state_layout_);
   }
 
   void ValidateSensorLayout() const {
@@ -937,12 +984,24 @@ class DrakeEnvPool {
         sensor_frame_bodies_.size(), Eigen::Vector3d::Zero());
     std::vector<Eigen::Vector4d> frame_quat_w(
         sensor_frame_bodies_.size(), Eigen::Vector4d::Zero());
+    std::vector<Eigen::Matrix3d> frame_rot_w(
+        sensor_frame_bodies_.size(), Eigen::Matrix3d::Identity());
+    std::vector<bool> frame_has_ref(sensor_frame_bodies_.size(), false);
+    std::vector<Eigen::Vector3d> frame_ref_positions(
+        sensor_frame_bodies_.size(), Eigen::Vector3d::Zero());
+    std::vector<Eigen::Vector3d> frame_ref_linvel_w(
+        sensor_frame_bodies_.size(), Eigen::Vector3d::Zero());
+    std::vector<Eigen::Vector3d> frame_ref_angvel_w(
+        sensor_frame_bodies_.size(), Eigen::Vector3d::Zero());
+    std::vector<Eigen::Matrix3d> frame_ref_rot_w(
+        sensor_frame_bodies_.size(), Eigen::Matrix3d::Identity());
     std::vector<Eigen::Vector3d> contact_forces(
         plant_->num_bodies(), Eigen::Vector3d::Zero());
     std::vector<int> contact_found(plant_->num_bodies(), 0);
     const Eigen::VectorXd q = plant_->GetPositions(*runtime.plant_context);
     const Eigen::VectorXd v = plant_->GetVelocities(*runtime.plant_context);
     auto sensor_frame_offsets = sensor_frame_offsets_.unchecked<2>();
+    auto sensor_frame_ref_offsets = sensor_frame_ref_offsets_.unchecked<2>();
     for (int frame = 0; frame < static_cast<int>(sensor_frame_bodies_.size()); ++frame) {
       const RigidTransform<double> x_wb =
           plant_->EvalBodyPoseInWorld(*runtime.plant_context, *sensor_frame_bodies_[frame]);
@@ -969,6 +1028,25 @@ class DrakeEnvPool {
       frame_zaxis_w[frame] = r_wb.col(2);
       frame_quat_w[frame] =
           Eigen::Vector4d(quat_wb.w(), quat_wb.x(), quat_wb.y(), quat_wb.z());
+      frame_rot_w[frame] = r_wb;
+
+      if (sensor_frame_ref_bodies_[frame] != nullptr) {
+        const RigidTransform<double> x_wr = plant_->EvalBodyPoseInWorld(
+            *runtime.plant_context, *sensor_frame_ref_bodies_[frame]);
+        const auto ref_velocity_w = plant_->EvalBodySpatialVelocityInWorld(
+            *runtime.plant_context, *sensor_frame_ref_bodies_[frame]);
+        const Eigen::Matrix3d r_wr = x_wr.rotation().matrix();
+        const Eigen::Vector3d ref_offset(sensor_frame_ref_offsets(frame, 0),
+                                         sensor_frame_ref_offsets(frame, 1),
+                                         sensor_frame_ref_offsets(frame, 2));
+        const Eigen::Vector3d ref_offset_w = r_wr * ref_offset;
+        frame_has_ref[frame] = true;
+        frame_ref_rot_w[frame] = r_wr;
+        frame_ref_positions[frame] = x_wr.translation() + ref_offset_w;
+        frame_ref_angvel_w[frame] = ref_velocity_w.rotational();
+        frame_ref_linvel_w[frame] =
+            ref_velocity_w.translational() + ref_velocity_w.rotational().cross(ref_offset_w);
+      }
     }
 
     const auto& contact_results =
@@ -1013,28 +1091,65 @@ class DrakeEnvPool {
           }
           break;
         case kFramePosition:
-          for (int axis = 0; axis < 3; ++axis) {
-            sensor(env_index, start + axis) = frame_positions[frame][axis];
+          {
+            Eigen::Vector3d value = frame_positions[frame];
+            if (frame_has_ref[frame]) {
+              value =
+                  frame_ref_rot_w[frame].transpose() * (value - frame_ref_positions[frame]);
+            }
+            for (int axis = 0; axis < 3; ++axis) {
+              sensor(env_index, start + axis) = value[axis];
+            }
           }
           break;
         case kFrameLinvel:
-          for (int axis = 0; axis < 3; ++axis) {
-            sensor(env_index, start + axis) = frame_linvel_w[frame][axis];
+          {
+            Eigen::Vector3d value = frame_linvel_w[frame];
+            if (frame_has_ref[frame]) {
+              value =
+                  frame_ref_rot_w[frame].transpose() * (value - frame_ref_linvel_w[frame]);
+            }
+            for (int axis = 0; axis < 3; ++axis) {
+              sensor(env_index, start + axis) = value[axis];
+            }
           }
           break;
         case kFrameAngvel:
-          for (int axis = 0; axis < 3; ++axis) {
-            sensor(env_index, start + axis) = frame_angvel_w[frame][axis];
+          {
+            Eigen::Vector3d value = frame_angvel_w[frame];
+            if (frame_has_ref[frame]) {
+              value =
+                  frame_ref_rot_w[frame].transpose() * (value - frame_ref_angvel_w[frame]);
+            }
+            for (int axis = 0; axis < 3; ++axis) {
+              sensor(env_index, start + axis) = value[axis];
+            }
           }
           break;
         case kFrameZAxis:
-          for (int axis = 0; axis < 3; ++axis) {
-            sensor(env_index, start + axis) = frame_zaxis_w[frame][axis];
+          {
+            Eigen::Vector3d value = frame_zaxis_w[frame];
+            if (frame_has_ref[frame]) {
+              value = frame_ref_rot_w[frame].transpose() * value;
+            }
+            for (int axis = 0; axis < 3; ++axis) {
+              sensor(env_index, start + axis) = value[axis];
+            }
           }
           break;
         case kFrameQuat:
-          for (int axis = 0; axis < 4; ++axis) {
-            sensor(env_index, start + axis) = frame_quat_w[frame][axis];
+          {
+            Eigen::Vector4d value = frame_quat_w[frame];
+            if (frame_has_ref[frame]) {
+              const Eigen::Matrix3d relative_rot =
+                  frame_ref_rot_w[frame].transpose() * frame_rot_w[frame];
+              const Eigen::Quaterniond relative_quat(relative_rot);
+              value = Eigen::Vector4d(relative_quat.w(), relative_quat.x(),
+                                      relative_quat.y(), relative_quat.z());
+            }
+            for (int axis = 0; axis < 4; ++axis) {
+              sensor(env_index, start + axis) = value[axis];
+            }
           }
           break;
         case kContactForce:
@@ -1159,17 +1274,22 @@ class DrakeEnvPool {
 
   template <typename Worker>
   void RunChunks(Worker worker) {
-    const int thread_count = std::min(nthread_, nbatch_);
+    RunRowChunks(nbatch_, worker);
+  }
+
+  template <typename Worker>
+  void RunRowChunks(int row_count, Worker worker) {
+    const int thread_count = std::min(nthread_, row_count);
     if (thread_count <= 1) {
-      worker(0, 0, nbatch_);
+      worker(0, 0, row_count);
       return;
     }
     std::vector<std::thread> threads;
     std::vector<std::exception_ptr> exceptions(thread_count);
     threads.reserve(thread_count);
     for (int thread = 0; thread < thread_count; ++thread) {
-      const int begin = thread * nbatch_ / thread_count;
-      const int end = (thread + 1) * nbatch_ / thread_count;
+      const int begin = thread * row_count / thread_count;
+      const int end = (thread + 1) * row_count / thread_count;
       threads.emplace_back([&, thread, begin, end]() {
         try {
           worker(thread, begin, end);
@@ -1214,6 +1334,8 @@ class DrakeEnvPool {
   StateLayout state_layout_;
   std::vector<int> sensor_frame_body_indices_;
   py::array_t<double> sensor_frame_offsets_;
+  std::vector<int> sensor_frame_ref_body_indices_;
+  py::array_t<double> sensor_frame_ref_offsets_;
   py::array_t<int> sensor_type_;
   py::array_t<int> sensor_index_;
   py::array_t<int> sensor_adr_;
@@ -1227,6 +1349,7 @@ class DrakeEnvPool {
   SceneGraph<double>* scene_graph_{};
   ModelInstanceIndex model_instance_;
   std::vector<const RigidBody<double>*> sensor_frame_bodies_;
+  std::vector<const RigidBody<double>*> sensor_frame_ref_bodies_;
   std::vector<int> actuator_position_start_;
   std::vector<int> actuator_velocity_start_;
   std::vector<double> compact_state_;
@@ -1246,37 +1369,41 @@ PYBIND11_MODULE(_drake_env_pool, m) {
                     py::array_t<double, py::array::c_style | py::array::forcecast>,
                     py::array_t<int, py::array::c_style | py::array::forcecast>,
                     py::array_t<double, py::array::c_style | py::array::forcecast>,
-                      py::array_t<double, py::array::c_style | py::array::forcecast>,
-                      py::array_t<double, py::array::c_style | py::array::forcecast>,
-                      py::array_t<double, py::array::c_style | py::array::forcecast>,
-                      py::array_t<double, py::array::c_style | py::array::forcecast>,
-                      py::array_t<int, py::array::c_style | py::array::forcecast>,
-                      py::array_t<int, py::array::c_style | py::array::forcecast>,
-                      py::array_t<int, py::array::c_style | py::array::forcecast>,
-                      py::array_t<int, py::array::c_style | py::array::forcecast>,
+                    py::array_t<double, py::array::c_style | py::array::forcecast>,
+                    py::array_t<double, py::array::c_style | py::array::forcecast>,
+                    py::array_t<double, py::array::c_style | py::array::forcecast>,
+                    py::array_t<double, py::array::c_style | py::array::forcecast>,
+                    py::array_t<int, py::array::c_style | py::array::forcecast>,
+                    py::array_t<int, py::array::c_style | py::array::forcecast>,
+                    py::array_t<int, py::array::c_style | py::array::forcecast>,
+                    py::array_t<int, py::array::c_style | py::array::forcecast>,
                     py::array_t<int, py::array::c_style | py::array::forcecast>,
                     const std::vector<std::string>&,
                     const std::vector<std::string>&,
                     const std::vector<std::string>&,
                     const std::vector<std::string>&,
                     const std::vector<int>&,
-                      py::array_t<double, py::array::c_style | py::array::forcecast>,
+                    py::array_t<double, py::array::c_style | py::array::forcecast>,
+                    const std::vector<int>&,
+                    py::array_t<double, py::array::c_style | py::array::forcecast>,
                     py::array_t<int, py::array::c_style | py::array::forcecast>,
                     py::array_t<int, py::array::c_style | py::array::forcecast>,
                     py::array_t<int, py::array::c_style | py::array::forcecast>,
                     py::array_t<int, py::array::c_style | py::array::forcecast>, int, int>(),
            py::arg("model_file"), py::arg("nbatch"), py::arg("sim_dt"),
            py::arg("ctrl_limits"), py::arg("torque_limits"),
-             py::arg("actuator_kind"), py::arg("actuator_gear"),
-             py::arg("actuator_stiffness"), py::arg("actuator_damping"),
-             py::arg("actuator_gainprm"), py::arg("actuator_biasprm"),
-             py::arg("joint_layout_kind"), py::arg("joint_layout_qpos_adr"),
+           py::arg("actuator_kind"), py::arg("actuator_gear"),
+           py::arg("actuator_stiffness"), py::arg("actuator_damping"),
+           py::arg("actuator_gainprm"), py::arg("actuator_biasprm"),
+           py::arg("joint_layout_kind"), py::arg("joint_layout_qpos_adr"),
            py::arg("joint_layout_qvel_adr"), py::arg("joint_layout_qpos_dim"),
            py::arg("joint_layout_qvel_dim"), py::arg("joint_layout_names"),
            py::arg("joint_layout_body_names"),
            py::arg("collision_filter_geom_names1"), py::arg("collision_filter_geom_names2"),
            py::arg("sensor_frame_body_indices"),
            py::arg("sensor_frame_offsets"),
+           py::arg("sensor_frame_ref_body_indices"),
+           py::arg("sensor_frame_ref_offsets"),
            py::arg("sensor_type"), py::arg("sensor_index"), py::arg("sensor_adr"),
            py::arg("sensor_dim"), py::arg("nsensordata"),
            py::arg("nthread") = 1)

@@ -41,9 +41,12 @@ class DrakeBatchRuntime:
         )
         self._model_contract = parse_mjcf_model_contract(self._drake_model.model_file)
         self._nthread = _resolve_nthread(self._num_envs, int(config.nthread))
-        sensor_frame_body_indices, sensor_frame_offsets = sensor_frames_as_pool_inputs(
-            self._model_contract
-        )
+        (
+            sensor_frame_body_indices,
+            sensor_frame_offsets,
+            sensor_frame_ref_body_indices,
+            sensor_frame_ref_offsets,
+        ) = sensor_frames_as_pool_inputs(self._model_contract)
         self._pool = DrakeEnvPool(
             self._drake_model.model_file,
             self._num_envs,
@@ -67,6 +70,8 @@ class DrakeBatchRuntime:
             self._model_contract.collision_filter_geom_names2,
             sensor_frame_body_indices,
             sensor_frame_offsets,
+            sensor_frame_ref_body_indices,
+            sensor_frame_ref_offsets,
             self._model_contract.sensor_type,
             self._model_contract.sensor_index,
             self._model_contract.sensor_adr,
@@ -109,8 +114,16 @@ class DrakeBatchRuntime:
             torque_limits=self._model_contract.torque_limits.copy(),
             actuator_stiffness=self._model_contract.actuator_stiffness.copy(),
             actuator_damping=self._model_contract.actuator_damping.copy(),
+            actuator_qpos_adr=self._model_contract.actuator_qpos_adr.copy(),
+            actuator_qvel_adr=self._model_contract.actuator_qvel_adr.copy(),
             joint_ranges=self._model_contract.joint_ranges.copy(),
             num_bodies=int(self._pool.num_bodies),
+            site_names=self._model_contract.site_names,
+            joint_names=self._model_contract.joint_layout_names,
+            joint_qpos_adr=self._model_contract.joint_layout_qpos_adr.copy(),
+            joint_qvel_adr=self._model_contract.joint_layout_qvel_adr.copy(),
+            joint_qpos_dim=self._model_contract.joint_layout_qpos_dim.copy(),
+            joint_qvel_dim=self._model_contract.joint_layout_qvel_dim.copy(),
             sensor_names=self._model_contract.sensor_names,
             sensor_adr=self._model_contract.sensor_adr.copy(),
             sensor_dim=self._model_contract.sensor_dim.copy(),
@@ -149,15 +162,35 @@ class DrakeBatchRuntime:
             torque_limits=info.torque_limits.copy(),
             actuator_stiffness=info.actuator_stiffness.copy(),
             actuator_damping=info.actuator_damping.copy(),
+            actuator_qpos_adr=info.actuator_qpos_adr.copy(),
+            actuator_qvel_adr=info.actuator_qvel_adr.copy(),
             joint_ranges=info.joint_ranges.copy(),
             num_bodies=info.num_bodies,
+            site_names=info.site_names,
+            joint_names=info.joint_names,
+            joint_qpos_adr=info.joint_qpos_adr.copy(),
+            joint_qvel_adr=info.joint_qvel_adr.copy(),
+            joint_qpos_dim=info.joint_qpos_dim.copy(),
+            joint_qvel_dim=info.joint_qvel_dim.copy(),
             sensor_names=info.sensor_names,
             sensor_adr=info.sensor_adr.copy(),
             sensor_dim=info.sensor_dim.copy(),
             nsensordata=info.nsensordata,
         )
 
-    def reset(self, env_ids: np.ndarray, qpos: np.ndarray, qvel: np.ndarray) -> None:
+    def keyframe_qpos(self, name: str) -> np.ndarray:
+        qpos = read_keyframe_qpos(self._model_file, str(name))
+        if qpos is None:
+            raise KeyError(f"Drake MJCF model does not contain keyframe {name!r}")
+        values = np.asarray(qpos, dtype=np.float64)
+        if values.shape != (self._model_info.nq,):
+            raise ValueError(
+                f"Drake MJCF keyframe {name!r} qpos must have shape "
+                f"({self._model_info.nq},), got {values.shape}"
+            )
+        return values.copy()
+
+    def reset(self, env_ids: np.ndarray, qpos: np.ndarray, qvel: np.ndarray) -> dict[str, Any]:
         indices = np.asarray(env_ids, dtype=np.int32)
         qpos_rows = np.asarray(qpos, dtype=np.float64)
         qvel_rows = np.asarray(qvel, dtype=np.float64)
@@ -170,8 +203,25 @@ class DrakeBatchRuntime:
         if qvel_rows.shape != (indices.size, self._model_info.nv):
             raise ValueError(f"qvel must have shape ({indices.size}, {self._model_info.nv})")
         output = self._pool.reset(indices, self._pack_state_rows(qpos_rows, qvel_rows), True)
-        self._apply_output(output)
-        self._apply_sensor_data(output)
+        state_rows = _require_output_array(
+            output,
+            "state",
+            (indices.size, int(self._pool.state_dim)),
+            "DrakeEnvPool reset",
+        )
+        sensor_rows = _require_output_array(
+            output,
+            "sensor_data",
+            (indices.size, self._model_info.nsensordata),
+            "DrakeEnvPool reset",
+        )
+        self._physics_state[indices] = state_rows
+        self._sensor_data[indices] = sensor_rows
+        return {
+            "env_ids": indices.copy(),
+            "state": state_rows.copy(),
+            "sensor_data": sensor_rows.copy(),
+        }
 
     def step(
         self,
@@ -267,6 +317,18 @@ def _resolve_nthread(num_envs: int, requested: int) -> int:
     if requested_count > 0:
         return min(env_count, requested_count)
     return min(env_count, max(1, cpu_count() * 2))
+
+
+def _require_output_array(
+    output: dict[str, Any],
+    key: str,
+    shape: tuple[int, ...],
+    source: str,
+) -> np.ndarray:
+    values = np.asarray(output[key], dtype=np.float64)
+    if values.shape != shape:
+        raise RuntimeError(f"{source} {key} must have shape {shape}, got {values.shape}")
+    return values
 
 
 def _pydrake_loaded() -> bool:

@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import struct
 import xml.etree.ElementTree as ET
-from collections.abc import Sequence
-from dataclasses import dataclass
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, replace
 from pathlib import Path
-from shutil import copytree
+from shutil import copy2, copytree
 from tempfile import TemporaryDirectory
 
 import numpy as np
@@ -55,7 +55,9 @@ JOINT_SENSOR_KIND_BY_TAG = {
     "jointactuatorfrc": SENSOR_KIND_JOINT_ACTUATOR_FORCE,
 }
 
-SUPPORTED_SENSOR_TAGS = frozenset({*FRAME_SENSOR_KIND_BY_TAG, *JOINT_SENSOR_KIND_BY_TAG, "contact"})
+SUPPORTED_SENSOR_TAGS = frozenset(
+    {*FRAME_SENSOR_KIND_BY_TAG, *JOINT_SENSOR_KIND_BY_TAG, "contact", "touch"}
+)
 
 SUPPORTED_ACTUATOR_TAGS = frozenset(
     {
@@ -87,6 +89,11 @@ class MjcfFrameSensorContract:
     body_name: str
     body_index: int
     offset: np.ndarray
+    ref_obj_name: str | None = None
+    ref_obj_type: str | None = None
+    ref_body_name: str | None = None
+    ref_body_index: int = -1
+    ref_offset: np.ndarray | None = None
 
     @property
     def dim(self) -> int:
@@ -203,6 +210,7 @@ class MjcfJointLayout:
 class DrakeMjcfModelContract:
     name: str
     body_indices: dict[str, int]
+    site_names: tuple[str, ...]
     joint_layouts: tuple[MjcfJointLayout, ...]
     collision_geoms: tuple[MjcfGeomCollisionContract, ...]
     actuators: tuple[MjcfActuatorContract, ...]
@@ -246,6 +254,22 @@ class DrakeMjcfModelContract:
     @property
     def joint_ranges(self) -> np.ndarray:
         return np.asarray([actuator.joint_range for actuator in self.actuators], dtype=np.float64)
+
+    @property
+    def actuator_qpos_adr(self) -> np.ndarray:
+        by_name = {layout.name: layout for layout in self.joint_layouts}
+        return np.asarray(
+            [by_name[actuator.joint_name].qpos_adr for actuator in self.actuators],
+            dtype=np.int32,
+        )
+
+    @property
+    def actuator_qvel_adr(self) -> np.ndarray:
+        by_name = {layout.name: layout for layout in self.joint_layouts}
+        return np.asarray(
+            [by_name[actuator.joint_name].qvel_adr for actuator in self.actuators],
+            dtype=np.int32,
+        )
 
     @property
     def joint_layout_kind(self) -> np.ndarray:
@@ -402,15 +426,17 @@ def parse_mjcf_model_contract(scene_path: str | Path) -> DrakeMjcfModelContract:
         defaults,
         joint_ranges_by_name,
     )
+    named_frames = _extract_named_frames(roots, defaults)
     frame_sensors, contact_sensors, joint_sensors = _extract_sensor_contract_fields(
         roots,
-        _extract_named_frames(roots, defaults),
+        named_frames,
         body_indices,
         {actuator.joint_name: index for index, actuator in enumerate(actuators)},
     )
     return DrakeMjcfModelContract(
         name=roots[0][1].attrib.get("model", path.stem),
         body_indices=body_indices,
+        site_names=tuple(name for obj_type, name in named_frames if obj_type == "site"),
         joint_layouts=joint_layouts,
         collision_geoms=collision_geoms,
         actuators=actuators,
@@ -441,6 +467,7 @@ def materialize_drake_compatible_mjcf(scene_path: str | Path) -> DrakeCompatible
     copied_root = temp_root / source_root.name
     copytree(source_root, copied_root, dirs_exist_ok=True)
     _copy_referenced_meshdirs(roots, source_root, copied_root)
+    _copy_referenced_mesh_files(roots, source_root, copied_root)
 
     for xml_path in copied_root.rglob("*.xml"):
         _expand_mjcf_defaults_in_file(xml_path, defaults)
@@ -469,15 +496,46 @@ def _copy_referenced_meshdirs(
         source_meshdir = (xml_path.parent / meshdir_path).resolve()
         if not source_meshdir.exists():
             continue
-        if xml_path.parent.resolve() == source_root.resolve():
-            copied_xml_dir = copied_root
-        else:
-            try:
-                copied_xml_dir = copied_root / xml_path.parent.resolve().relative_to(source_root.resolve())
-            except ValueError:
-                copied_xml_dir = copied_root
+        copied_xml_dir = _copied_xml_dir(xml_path, source_root, copied_root)
         target_meshdir = (copied_xml_dir / meshdir_path).resolve()
         copytree(source_meshdir, target_meshdir, dirs_exist_ok=True)
+
+
+def _copy_referenced_mesh_files(
+    roots: Sequence[tuple[Path, ET.Element]],
+    source_root: Path,
+    copied_root: Path,
+) -> None:
+    for xml_path, root in roots:
+        compiler = root.find("./compiler")
+        meshdir = Path(compiler.attrib.get("meshdir", "")) if compiler is not None else Path()
+        source_mesh_root = meshdir if meshdir.is_absolute() else xml_path.parent / meshdir
+        copied_xml_dir = _copied_xml_dir(xml_path, source_root, copied_root)
+        copied_mesh_root = meshdir if meshdir.is_absolute() else copied_xml_dir / meshdir
+        for mesh in root.findall(".//asset/mesh"):
+            file_attr = mesh.attrib.get("file")
+            if not file_attr:
+                continue
+            source_attr = Path(file_attr)
+            if source_attr.is_absolute():
+                continue
+            source = (source_mesh_root / source_attr).resolve()
+            if not source.exists() or not source.is_file():
+                continue
+            target = (copied_mesh_root / source_attr).resolve()
+            if target.exists():
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            copy2(source, target)
+
+
+def _copied_xml_dir(xml_path: Path, source_root: Path, copied_root: Path) -> Path:
+    if xml_path.parent.resolve() == source_root.resolve():
+        return copied_root
+    try:
+        return copied_root / xml_path.parent.resolve().relative_to(source_root.resolve())
+    except ValueError:
+        return copied_root
 
 
 def read_keyframe_qpos(scene_path: str | Path, name: str) -> np.ndarray | None:
@@ -495,10 +553,22 @@ def read_keyframe_qpos(scene_path: str | Path, name: str) -> np.ndarray | None:
     return None
 
 
-def sensor_frames_as_pool_inputs(model_contract: DrakeMjcfModelContract) -> tuple[list[int], np.ndarray]:
+def sensor_frames_as_pool_inputs(
+    model_contract: DrakeMjcfModelContract,
+) -> tuple[list[int], np.ndarray, list[int], np.ndarray]:
     body_indices = [sensor.body_index for sensor in model_contract.frame_sensors]
     offsets = [sensor.offset for sensor in model_contract.frame_sensors]
-    return body_indices, np.asarray(offsets, dtype=np.float64).reshape((-1, 3))
+    ref_body_indices = [sensor.ref_body_index for sensor in model_contract.frame_sensors]
+    ref_offsets = [
+        np.zeros(3, dtype=np.float64) if sensor.ref_offset is None else sensor.ref_offset
+        for sensor in model_contract.frame_sensors
+    ]
+    return (
+        body_indices,
+        np.asarray(offsets, dtype=np.float64).reshape((-1, 3)),
+        ref_body_indices,
+        np.asarray(ref_offsets, dtype=np.float64).reshape((-1, 3)),
+    )
 
 
 def _load_xml_roots(scene_path: Path) -> list[tuple[Path, ET.Element]]:
@@ -511,11 +581,11 @@ def _load_xml_roots(scene_path: Path) -> list[tuple[Path, ET.Element]]:
             return
         seen.add(resolved)
         root = ET.parse(resolved).getroot()
-        roots.append((resolved, root))
         for include in root.findall(".//include"):
             include_file = include.attrib.get("file")
             if include_file:
                 visit(resolved.parent / include_file)
+        roots.append((resolved, root))
 
     visit(scene_path)
     return roots
@@ -756,8 +826,74 @@ def _expand_mjcf_defaults_in_file(
 
     for body in root.findall("./worldbody/body"):
         walk_body(body, None)
+
+    joint_ranges_by_name: dict[str, np.ndarray] = {}
+    for joint in root.findall(".//joint"):
+        name = joint.attrib.get("name")
+        joint_range = _parse_vector(joint.attrib.get("range"))
+        if name and joint_range is not None and joint_range.size >= 2:
+            joint_ranges_by_name[name] = np.asarray(joint_range[:2], dtype=np.float64)
+
+    for actuator in root.findall("./actuator/*"):
+        if actuator.tag not in SUPPORTED_ACTUATOR_TAGS:
+            continue
+        attrs = _merged_default_attrs(
+            defaults,
+            actuator.attrib.get("class"),
+            actuator.tag,
+            actuator.attrib,
+        )
+        _resolve_drake_actuator_ctrlrange(actuator.tag, attrs, joint_ranges_by_name)
+        if attrs.get("forcerange") and not attrs.get("forcelimited"):
+            attrs["forcelimited"] = "true"
+        if attrs.get("ctrlrange") and not attrs.get("ctrllimited"):
+            attrs["ctrllimited"] = "true"
+        attrs.pop("inheritrange", None)
+        if actuator.tag == "general":
+            actuator.tag = "motor"
+            attrs = _drake_motor_attrs(attrs)
+        actuator.attrib.clear()
+        actuator.attrib.update(attrs)
     _rewrite_mesh_assets_for_drake(root, path.parent)
     tree.write(path, encoding="utf-8", xml_declaration=False)
+
+
+def _resolve_drake_actuator_ctrlrange(
+    tag: str,
+    attrs: dict[str, str],
+    joint_ranges_by_name: Mapping[str, np.ndarray],
+) -> None:
+    if tag != "position" or attrs.get("ctrlrange"):
+        return
+    inherit_range = float(attrs.get("inheritrange", 0.0))
+    joint_range = joint_ranges_by_name.get(attrs.get("joint", ""))
+    if inherit_range <= 0.0 or joint_range is None:
+        return
+    midpoint = 0.5 * float(joint_range[0] + joint_range[1])
+    half_width = 0.5 * inherit_range * float(joint_range[1] - joint_range[0])
+    attrs["ctrlrange"] = f"{midpoint - half_width:.17g} {midpoint + half_width:.17g}"
+
+
+def _drake_motor_attrs(attrs: Mapping[str, str]) -> dict[str, str]:
+    allowed = {
+        "name",
+        "joint",
+        "jointinparent",
+        "site",
+        "refsite",
+        "body",
+        "tendon",
+        "cranksite",
+        "slidersite",
+        "gear",
+        "ctrlrange",
+        "ctrllimited",
+        "forcerange",
+        "forcelimited",
+        "class",
+        "user",
+    }
+    return {key: value for key, value in attrs.items() if key in allowed}
 
 
 def _is_noncolliding_geom(attrs: dict[str, str]) -> bool:
@@ -1088,6 +1224,12 @@ def _extract_named_frames(
         body_name = body.attrib.get("name")
         element_class = body.attrib.get("childclass", inherited_class)
         if body_name:
+            frames[("body", body_name)] = MjcfFrameContract(
+                obj_type="body",
+                obj_name=body_name,
+                body_name=body_name,
+                offset=np.zeros(3, dtype=np.float64),
+            )
             for tag in ("site", "geom"):
                 for element in body.findall(f"./{tag}"):
                     obj_name = element.attrib.get("name")
@@ -1145,6 +1287,9 @@ def _extract_sensor_contract_fields(
                         _build_contact_sensor_contract(sensor, frames, body_indices, frame_object_to_index)
                     )
                     continue
+                if tag == "touch":
+                    contact_sensors.append(_build_touch_sensor_contract(sensor, frames, body_indices))
+                    continue
                 if tag in JOINT_SENSOR_KIND_BY_TAG:
                     joint_sensors.append(
                         _build_joint_sensor_contract(sensor, tag, actuator_indices_by_joint)
@@ -1155,8 +1300,27 @@ def _extract_sensor_contract_fields(
                 frame_object_to_index.setdefault(frame_sensor.obj_name, len(frame_sensors))
                 frame_sensors.append(frame_sensor)
 
+    contact_sensors = _resolve_contact_frame_indices(contact_sensors, frame_sensors)
     _validate_unique_sensor_names((*frame_sensors, *contact_sensors, *joint_sensors))
     return tuple(frame_sensors), tuple(contact_sensors), tuple(joint_sensors)
+
+
+def _resolve_contact_frame_indices(
+    contact_sensors: list[MjcfContactSensorContract],
+    frame_sensors: list[MjcfFrameSensorContract],
+) -> list[MjcfContactSensorContract]:
+    frame_object_to_index: dict[str, int] = {}
+    for index, sensor in enumerate(frame_sensors):
+        frame_object_to_index.setdefault(sensor.obj_name, index)
+    resolved: list[MjcfContactSensorContract] = []
+    for sensor in contact_sensors:
+        frame_sensor_index = sensor.frame_sensor_index
+        if frame_sensor_index is None:
+            frame_sensor_index = frame_object_to_index.get(sensor.geom2)
+        if frame_sensor_index is None:
+            frame_sensor_index = frame_object_to_index.get(sensor.geom1)
+        resolved.append(replace(sensor, frame_sensor_index=frame_sensor_index))
+    return resolved
 
 
 def _build_frame_sensor_contract(
@@ -1168,10 +1332,6 @@ def _build_frame_sensor_contract(
     name = sensor.attrib.get("name")
     if not name:
         raise ValueError(f"DrakeUni MJCF <{tag}> sensor requires a name")
-    if tag == "framequat" and (sensor.attrib.get("reftype") or sensor.attrib.get("refname")):
-        raise ValueError(
-            f"DrakeUni MJCF <framequat> sensor {name!r} does not yet support reftype/refname"
-        )
     if tag in {"gyro", "accelerometer", "velocimeter"}:
         obj_type = "site"
         obj_name = sensor.attrib.get("site")
@@ -1189,6 +1349,30 @@ def _build_frame_sensor_contract(
     body_index = body_indices.get(frame.body_name)
     if body_index is None:
         raise ValueError(f"Frame {obj_name!r} refers to unknown body {frame.body_name!r}")
+    ref_obj_type = sensor.attrib.get("reftype")
+    ref_obj_name = sensor.attrib.get("refname")
+    ref_frame = None
+    ref_body_name = None
+    ref_body_index = -1
+    ref_offset = np.zeros(3, dtype=np.float64)
+    if ref_obj_type or ref_obj_name:
+        if not ref_obj_type or not ref_obj_name:
+            raise ValueError(
+                f"DrakeUni MJCF sensor {name!r} requires both reftype and refname when "
+                "either is provided"
+            )
+        ref_frame = frames.get((ref_obj_type, ref_obj_name))
+        if ref_frame is None:
+            raise ValueError(
+                f"DrakeUni MJCF sensor {name!r} refers to unknown reference "
+                f"{ref_obj_type} {ref_obj_name!r}"
+            )
+        ref_body_name = ref_frame.body_name
+        resolved_ref_body_index = body_indices.get(ref_body_name)
+        if resolved_ref_body_index is None:
+            raise ValueError(f"Reference frame {ref_obj_name!r} refers to unknown body {ref_body_name!r}")
+        ref_body_index = int(resolved_ref_body_index)
+        ref_offset = ref_frame.offset
     return MjcfFrameSensorContract(
         name=name,
         tag=tag,
@@ -1197,6 +1381,11 @@ def _build_frame_sensor_contract(
         body_name=frame.body_name,
         body_index=body_index,
         offset=frame.offset,
+        ref_obj_name=ref_obj_name,
+        ref_obj_type=ref_obj_type,
+        ref_body_name=ref_body_name,
+        ref_body_index=ref_body_index,
+        ref_offset=ref_offset,
     )
 
 
@@ -1238,6 +1427,36 @@ def _build_contact_sensor_contract(
         body_name=body_name,
         body_index=body_index,
         frame_sensor_index=frame_sensor_index,
+    )
+
+
+def _build_touch_sensor_contract(
+    sensor: ET.Element,
+    frames: dict[tuple[str, str], MjcfFrameContract],
+    body_indices: dict[str, int],
+) -> MjcfContactSensorContract:
+    name = sensor.attrib.get("name")
+    site = sensor.attrib.get("site")
+    if not name:
+        raise ValueError("DrakeUni MJCF <touch> sensor requires a name")
+    if not site:
+        raise ValueError(f"DrakeUni MJCF <touch> sensor {name!r} requires site=")
+    frame = frames.get(("site", site))
+    if frame is None:
+        raise ValueError(f"DrakeUni MJCF <touch> sensor {name!r} refers to unknown site {site!r}")
+    body_index = body_indices.get(frame.body_name)
+    if body_index is None:
+        raise ValueError(f"Touch sensor {name!r} refers to unknown body {frame.body_name!r}")
+    return MjcfContactSensorContract(
+        name=name,
+        geom1=site,
+        geom2="",
+        data="found",
+        num=1,
+        reduce="sum",
+        body_name=frame.body_name,
+        body_index=int(body_index),
+        frame_sensor_index=None,
     )
 
 

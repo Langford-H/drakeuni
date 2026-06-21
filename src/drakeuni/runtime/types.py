@@ -36,8 +36,16 @@ class DrakeModelInfo:
     torque_limits: np.ndarray
     actuator_stiffness: np.ndarray
     actuator_damping: np.ndarray
+    actuator_qpos_adr: np.ndarray
+    actuator_qvel_adr: np.ndarray
     joint_ranges: np.ndarray
     num_bodies: int
+    site_names: tuple[str, ...]
+    joint_names: tuple[str, ...]
+    joint_qpos_adr: np.ndarray
+    joint_qvel_adr: np.ndarray
+    joint_qpos_dim: np.ndarray
+    joint_qvel_dim: np.ndarray
     sensor_names: tuple[str, ...]
     sensor_adr: np.ndarray
     sensor_dim: np.ndarray
