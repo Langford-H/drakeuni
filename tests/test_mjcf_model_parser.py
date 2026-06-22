@@ -49,8 +49,8 @@ def _write_actuator_scene(tmp_path: Path, actuator_xml: str) -> Path:
     return scene
 
 
-def test_go1_drake_scene_mjcf_model_parser_discovers_contract() -> None:
-    scene = _asset("src/unilab/assets/robots/go1/scene_flat_drake.xml")
+def test_go1_scene_mjcf_model_parser_discovers_contract() -> None:
+    scene = _asset("src/unilab/assets/robots/go1/scene_flat.xml")
     model_contract = parse_mjcf_model_contract(scene)
 
     assert model_contract.body_index("trunk") == 1

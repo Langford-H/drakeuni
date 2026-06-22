@@ -14,6 +14,12 @@ environment count, simulation step size, and worker count. Task semantics such
 as base-body meaning, named sensor views, rewards, and observations belong to
 the consuming UniLab backend/task layer.
 
+The input model is the original UniLab MJCF scene, for example
+`scene_flat.xml`. DrakeUni materializes a temporary Drake-compatible copy at
+runtime by expanding MJCF defaults and converting unsupported mesh formats when
+needed. Callers should not commit or pass pre-generated files such as
+`*_drake.xml` or converted OBJ asset directories.
+
 ## Directory Roles
 
 `src/drakeuni/runtime/` is the Python-facing runtime interface. It owns the
@@ -57,7 +63,7 @@ from drakeuni.runtime import DrakeBatchConfig, create_runtime
 
 runtime = create_runtime(
     DrakeBatchConfig(
-        model_file="/path/to/scene_flat_drake.xml",
+        model_file="/path/to/scene_flat.xml",
         num_envs=32,
         sim_dt=0.002,
         nthread=8,
